@@ -5,14 +5,17 @@ const { color, symbols } = require('./formatting');
 
 /**
  * Apresenta um menu de seleção interativo no terminal usando readline/keypress nativo.
+ * Suporta navegação por setas, paginação por janela e pesquisa/filtro em tempo real.
  *
  * @param {Object} options
  * @param {string} options.message Mensagem/título do prompt
  * @param {Array<{label: string, value: any, hint?: string}>} options.choices Lista de opções
  * @param {number} [options.initialIndex=0] Índice pré-selecionado
+ * @param {boolean} [options.searchable=false] Se permite digitar texto para filtrar opções em tempo real
+ * @param {number} [options.pageSize=10] Número máximo de itens visíveis simultaneamente
  * @returns {Promise<any>} O valor da opção escolhida, ou null se cancelado
  */
-function select({ message, choices = [], initialIndex = 0 }) {
+function select({ message, choices = [], initialIndex = 0, searchable = false, pageSize = 10 }) {
   return new Promise((resolve) => {
     if (!process.stdin.isTTY || choices.length === 0) {
       if (choices.length > 0) {
@@ -21,7 +24,10 @@ function select({ message, choices = [], initialIndex = 0 }) {
       return resolve(null);
     }
 
+    let searchTerm = '';
     let selectedIndex = Math.max(0, Math.min(initialIndex, choices.length - 1));
+    let scrollOffset = 0;
+    let lastRenderedLineCount = 0;
     let isRendered = false;
 
     readline.emitKeypressEvents(process.stdin);
@@ -34,28 +40,99 @@ function select({ message, choices = [], initialIndex = 0 }) {
     // Oculta cursor
     process.stdout.write('\x1b[?25l');
 
+    function getVisibleChoices() {
+      let filtered = choices;
+      if (searchable && searchTerm.trim()) {
+        const query = searchTerm.trim().toLowerCase();
+        filtered = choices.filter((c) => {
+          if (c.value === '__custom__') return true;
+          return c.label.toLowerCase().includes(query) || (c.hint && c.hint.toLowerCase().includes(query));
+        });
+
+        const exactMatch = filtered.some((c) => c.label.toLowerCase() === query);
+        if (!exactMatch && query.length > 0) {
+          filtered = [
+            {
+              label: `Personalizado: "${searchTerm.trim()}"`,
+              value: '__custom_direct__',
+              customValue: searchTerm.trim(),
+              hint: 'usar exatamente o que digitou',
+            },
+            ...filtered,
+          ];
+        }
+      }
+      return filtered;
+    }
+
+    function adjustScroll(currentFiltered, selIdx) {
+      if (selIdx < scrollOffset) {
+        scrollOffset = selIdx;
+      } else if (selIdx >= scrollOffset + pageSize) {
+        scrollOffset = selIdx - pageSize + 1;
+      }
+      scrollOffset = Math.max(0, Math.min(scrollOffset, Math.max(0, currentFiltered.length - pageSize)));
+    }
+
     function render() {
+      const currentFiltered = getVisibleChoices();
+      if (selectedIndex >= currentFiltered.length) {
+        selectedIndex = Math.max(0, currentFiltered.length - 1);
+      }
+      adjustScroll(currentFiltered, selectedIndex);
+
       const lines = [];
-      lines.push(`${color.bold(color.cyan('?'))} ${color.bold(message)} ${color.dim('(Use ↑/↓ para navegar, Enter para escolher)')}`);
 
-      choices.forEach((choice, index) => {
-        const isSelected = index === selectedIndex;
-        const prefix = isSelected ? color.bold(color.cyan('▶ ')) : '  ';
-        const label = isSelected ? color.bold(color.white(choice.label)) : color.gray(choice.label);
-        const hint = choice.hint ? ` ${color.dim(`(${choice.hint})`)}` : '';
-        lines.push(`${prefix}${label}${hint}`);
-      });
+      // Cabeçalho com status da pesquisa
+      let header = `${color.bold(color.cyan('?'))} ${color.bold(message)}`;
+      if (searchable) {
+        if (searchTerm) {
+          header += ` ${color.bold(color.yellow(`"${searchTerm}"`))} ${color.dim(`(${currentFiltered.length} encontrados)`)}`;
+        } else {
+          header += ` ${color.dim('(digite para filtrar)')}`;
+        }
+      } else {
+        header += ` ${color.dim('(Use ↑/↓ para navegar, Enter para escolher)')}`;
+      }
+      lines.push(header);
 
-      if (isRendered) {
-        // Move cursor para cima e limpa linhas anteriores
-        const totalLinesToClear = choices.length + 1;
-        process.stdout.write(`\x1b[${totalLinesToClear}A\r`);
+      if (currentFiltered.length === 0) {
+        lines.push(`  ${color.yellow('Nenhum modelo encontrado para esta pesquisa.')}`);
+      } else {
+        const visibleSlice = currentFiltered.slice(scrollOffset, scrollOffset + pageSize);
+
+        if (scrollOffset > 0) {
+          lines.push(color.dim(`  ▲ (${scrollOffset} modelos anteriores...)`));
+        }
+
+        visibleSlice.forEach((choice, idx) => {
+          const actualIdx = scrollOffset + idx;
+          const isSelected = actualIdx === selectedIndex;
+          const prefix = isSelected ? color.bold(color.cyan('▶ ')) : '  ';
+          const label = isSelected ? color.bold(color.white(choice.label)) : color.gray(choice.label);
+          const hint = choice.hint ? ` ${color.dim(`(${choice.hint})`)}` : '';
+          lines.push(`${prefix}${label}${hint}`);
+        });
+
+        const remainingBelow = currentFiltered.length - (scrollOffset + visibleSlice.length);
+        if (remainingBelow > 0) {
+          lines.push(color.dim(`  ▼ (${remainingBelow} mais modelos abaixo...)`));
+        }
+      }
+
+      if (searchable) {
+        lines.push(color.dim('  (↑/↓: navegar • Enter: escolher • Digite: filtrar • Esc: limpar)'));
+      }
+
+      if (isRendered && lastRenderedLineCount > 0) {
+        process.stdout.write(`\x1b[${lastRenderedLineCount}A\r`);
       }
 
       lines.forEach((line) => {
         process.stdout.write(`\x1b[2K${line}\n`);
       });
 
+      lastRenderedLineCount = lines.length;
       isRendered = true;
     }
 
@@ -72,21 +149,40 @@ function select({ message, choices = [], initialIndex = 0 }) {
     function onKeypress(str, key) {
       if (!key) return;
 
-      if ((key.ctrl && key.name === 'c') || key.name === 'escape') {
+      if ((key.ctrl && key.name === 'c')) {
         cleanup();
         process.stdout.write('\n' + color.dim('Operação cancelada.') + '\n');
         resolve(null);
         return;
       }
 
-      if (key.name === 'up' || key.name === 'k') {
-        selectedIndex = (selectedIndex - 1 + choices.length) % choices.length;
+      if (key.name === 'escape') {
+        if (searchable && searchTerm.length > 0) {
+          searchTerm = '';
+          selectedIndex = 0;
+          render();
+          return;
+        }
+        cleanup();
+        process.stdout.write('\n' + color.dim('Operação cancelada.') + '\n');
+        resolve(null);
+        return;
+      }
+
+      if (key.name === 'up' || (key.ctrl && key.name === 'p') || (!searchable && key.name === 'k')) {
+        const currentFiltered = getVisibleChoices();
+        if (currentFiltered.length > 0) {
+          selectedIndex = (selectedIndex - 1 + currentFiltered.length) % currentFiltered.length;
+        }
         render();
         return;
       }
 
-      if (key.name === 'down' || key.name === 'j') {
-        selectedIndex = (selectedIndex + 1) % choices.length;
+      if (key.name === 'down' || (key.ctrl && key.name === 'n') || (!searchable && key.name === 'j')) {
+        const currentFiltered = getVisibleChoices();
+        if (currentFiltered.length > 0) {
+          selectedIndex = (selectedIndex + 1) % currentFiltered.length;
+        }
         render();
         return;
       }
@@ -98,35 +194,73 @@ function select({ message, choices = [], initialIndex = 0 }) {
       }
 
       if (key.name === 'end') {
-        selectedIndex = choices.length - 1;
+        const currentFiltered = getVisibleChoices();
+        selectedIndex = Math.max(0, currentFiltered.length - 1);
         render();
         return;
       }
 
-      if (str && /^[1-9]$/.test(str)) {
+      if (key.name === 'pageup') {
+        selectedIndex = Math.max(0, selectedIndex - pageSize);
+        render();
+        return;
+      }
+
+      if (key.name === 'pagedown') {
+        const currentFiltered = getVisibleChoices();
+        selectedIndex = Math.min(Math.max(0, currentFiltered.length - 1), selectedIndex + pageSize);
+        render();
+        return;
+      }
+
+      if (key.name === 'backspace') {
+        if (searchable && searchTerm.length > 0) {
+          searchTerm = searchTerm.slice(0, -1);
+          selectedIndex = 0;
+          render();
+        }
+        return;
+      }
+
+      if (key.name === 'return' || key.name === 'enter') {
+        const currentFiltered = getVisibleChoices();
+        if (currentFiltered.length === 0) return;
+        cleanup();
+
+        if (lastRenderedLineCount > 0) {
+          process.stdout.write(`\x1b[${lastRenderedLineCount}A\r`);
+          for (let i = 0; i < lastRenderedLineCount; i++) {
+            process.stdout.write('\x1b[2K\n');
+          }
+          process.stdout.write(`\x1b[${lastRenderedLineCount}A\r`);
+        }
+
+        const chosen = currentFiltered[selectedIndex];
+        const resultValue = chosen.value === '__custom_direct__' ? chosen.customValue : chosen.value;
+        process.stdout.write(
+          `${symbols.check} ${color.bold(message)} ${color.bold(color.cyan(chosen.label))}\n\n`
+        );
+        resolve(resultValue);
+        return;
+      }
+
+      // Tecla de atalho numérico (apenas quando não estiver em modo de busca)
+      if (!searchable && str && /^[1-9]$/.test(str)) {
         const num = parseInt(str, 10);
-        if (num <= choices.length) {
+        const currentFiltered = getVisibleChoices();
+        if (num <= currentFiltered.length) {
           selectedIndex = num - 1;
           render();
           return;
         }
       }
 
-      if (key.name === 'return' || key.name === 'enter' || key.name === 'space') {
-        cleanup();
-        // Redesenha a linha de confirmação de forma limpa
-        const totalLinesToClear = choices.length + 1;
-        process.stdout.write(`\x1b[${totalLinesToClear}A\r`);
-        for (let i = 0; i <= choices.length; i++) {
-          process.stdout.write('\x1b[2K\n');
-        }
-        process.stdout.write(`\x1b[${choices.length + 1}A\r`);
-
-        const chosen = choices[selectedIndex];
-        process.stdout.write(
-          `${symbols.check} ${color.bold(message)} ${color.bold(color.cyan(chosen.label))}\n\n`
-        );
-        resolve(chosen.value);
+      // Se for tecla de texto digitável para filtro
+      if (searchable && str && !key.ctrl && !key.meta && str.length === 1 && str.charCodeAt(0) >= 32) {
+        searchTerm += str;
+        selectedIndex = 0;
+        render();
+        return;
       }
     }
 

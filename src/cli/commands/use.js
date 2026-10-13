@@ -1,14 +1,94 @@
 'use strict';
 
+const https = require('node:https');
+const http = require('node:http');
+const { execSync } = require('node:child_process');
+const os = require('node:os');
+const path = require('node:path');
 const { select, input } = require('../interactive');
 const { color, symbols } = require('../formatting');
 const configManager = require('../config-manager');
 const systemd = require('../systemd');
 
 /**
- * Exibe seleção de modelo para o provedor ou solicita digitação de modelo personalizado.
+ * Carrega a lista de modelos dinamicamente do provedor com fallback para a lista local/código.
  */
-async function selectOrInputModel(providerName, availableModels, currentActiveModel) {
+async function fetchAvailableModels(providerName, providerConfig) {
+  const localModels = providerConfig?.models || (providerName === 'antigravity' ? configManager.DEFAULT_ANTIGRAVITY_MODELS : []);
+
+  if (providerName === 'antigravity') {
+    try {
+      const agyBin = process.env.AGY_BIN || path.join(os.homedir(), '.local/bin/agy');
+      const out = execSync(`${agyBin} models`, {
+        encoding: 'utf8',
+        timeout: 4000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const parsed = [];
+      for (const rawLine of out.split('\n')) {
+        const clean = rawLine.replace(/[\u2800-\u28FF]|Fetching available models\.\.\./g, '').trim();
+        if (!clean) continue;
+        const modelId = clean.split(/\s+/)[0];
+        if (modelId && !modelId.startsWith('Usage:') && !modelId.startsWith('Error:')) {
+          parsed.push(modelId);
+        }
+      }
+      if (parsed.length > 0) {
+        const combined = Array.from(new Set([...localModels, ...parsed]));
+        return { models: combined, dynamic: true, source: 'agy CLI' };
+      }
+    } catch (_) {}
+  } else if (providerConfig?.baseUrl) {
+    try {
+      const parsedUrl = new URL(providerConfig.baseUrl.replace(/\/+$/, '') + '/models');
+      const isHttps = parsedUrl.protocol === 'https:';
+      const transport = isHttps ? https : http;
+      const headers = { 'User-Agent': 'agent-proxy/1.0.0' };
+      if (providerConfig.apiKey) headers['Authorization'] = `Bearer ${providerConfig.apiKey}`;
+
+      const dynamicModels = await new Promise((resolve) => {
+        const req = transport.get(parsedUrl, { headers, timeout: 3500 }, (res) => {
+          if (res.statusCode !== 200) return resolve(null);
+          let body = '';
+          res.on('data', (c) => { body += c; });
+          res.on('end', () => {
+            try {
+              const json = JSON.parse(body);
+              if (Array.isArray(json.data)) {
+                return resolve(json.data.map((m) => m.id).filter(Boolean));
+              }
+            } catch (_) {}
+            resolve(null);
+          });
+        });
+        req.on('error', () => resolve(null));
+        req.on('timeout', () => { req.destroy(); resolve(null); });
+      });
+
+      if (dynamicModels && dynamicModels.length > 0) {
+        const combined = Array.from(new Set([...localModels, ...dynamicModels]));
+        return { models: combined, dynamic: true, source: providerConfig.baseUrl };
+      }
+    } catch (_) {}
+  }
+
+  return { models: localModels, dynamic: false, source: 'cache/local' };
+}
+
+/**
+ * Exibe seleção de modelo para o provedor com busca/filtro e opção personalizada.
+ */
+async function selectOrInputModel(providerName, providerConfig, currentActiveModel) {
+  process.stdout.write(`  ${color.dim(`⚡ Carregando modelos disponíveis em [${providerName}]...`)}\r`);
+  const { models: availableModels, dynamic, source } = await fetchAvailableModels(providerName, providerConfig);
+  process.stdout.write('\x1b[2K\r');
+
+  if (dynamic) {
+    console.log(`  ${color.green('✔')} ${color.bold(String(availableModels.length))} modelos carregados via ${color.cyan(source)}.`);
+  } else if (availableModels.length > 0) {
+    console.log(`  ${color.dim(`ℹ Usando lista local/padrão (${availableModels.length} modelos disponíveis).`)}`);
+  }
+
   if (availableModels.length === 0) {
     console.log(`${symbols.warn} Provedor ${color.magenta(providerName)} não possui modelos pré-cadastrados.`);
     return await input({
@@ -33,6 +113,8 @@ async function selectOrInputModel(providerName, availableModels, currentActiveMo
     message: `Escolha o Modelo em [${color.magenta(providerName)}]:`,
     choices,
     initialIndex: defaultIdx !== -1 ? defaultIdx : 0,
+    searchable: true,
+    pageSize: 10,
   });
 
   if (!chosen) return null;
@@ -73,13 +155,12 @@ async function handleUse(args = []) {
     if (providers[firstArg]) {
       const providerArg = firstArg;
       const providerConfig = providers[providerArg];
-      const availableModels = providerConfig?.models || (providerArg === 'antigravity' ? configManager.DEFAULT_ANTIGRAVITY_MODELS : []);
 
-      // Se houver TTY, abre seletor interativo para os modelos do provedor (com opção personalizada)
+      // Se houver TTY, abre seletor interativo para os modelos do provedor (com carregamento dinâmico e busca)
       if (process.stdin.isTTY) {
         console.log();
         const activeModelForProv = currentActive.provider === providerArg ? currentActive.model : null;
-        const chosenModel = await selectOrInputModel(providerArg, availableModels, activeModelForProv);
+        const chosenModel = await selectOrInputModel(providerArg, providerConfig, activeModelForProv);
 
         if (!chosenModel) return;
 
@@ -94,6 +175,7 @@ async function handleUse(args = []) {
         console.log();
         return;
       } else {
+        const availableModels = providerConfig?.models || (providerArg === 'antigravity' ? configManager.DEFAULT_ANTIGRAVITY_MODELS : []);
         if (availableModels.length === 0) {
           console.log();
           console.error(`${symbols.cross} ${color.red(`Provedor '${providerArg}' não possui modelos cadastrados.`)}`);
@@ -190,16 +272,10 @@ async function handleUse(args = []) {
 
   if (!chosenProvider) return;
 
-  // Passo 2: Escolher Modelo do Provedor Selecionado (com opção de modelo personalizado)
+  // Passo 2: Escolher Modelo do Provedor Selecionado (com carregamento dinâmico, busca e personalizado)
   const providerConfig = providers[chosenProvider];
-  let availableModels = providerConfig?.models || [];
-
-  if (availableModels.length === 0 && chosenProvider === 'antigravity') {
-    availableModels = configManager.DEFAULT_ANTIGRAVITY_MODELS;
-  }
-
   const activeModelForProv = currentActive.provider === chosenProvider ? currentActive.model : null;
-  const chosenModel = await selectOrInputModel(chosenProvider, availableModels, activeModelForProv);
+  const chosenModel = await selectOrInputModel(chosenProvider, providerConfig, activeModelForProv);
 
   if (!chosenModel) return;
 
