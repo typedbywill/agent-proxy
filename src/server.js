@@ -364,8 +364,24 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
   }
 }
 
+function isReasoningModel(model) {
+  const m = String(model || '').toLowerCase();
+  return (
+    m.includes('o1') ||
+    m.includes('o3') ||
+    m.includes('o4') ||
+    m.includes('reason') ||
+    m.includes('gpt-5') ||
+    m.includes('gpt-6') ||
+    m.includes('deepseek-r1') ||
+    m.startsWith('o1') ||
+    m.startsWith('o3')
+  );
+}
+
 function convertAnthropicToOpenAIPayload(payload, model) {
   const messages = [];
+  const reasoning = isReasoningModel(model);
 
   if (payload.system) {
     const systemText = typeof payload.system === 'string'
@@ -374,7 +390,8 @@ function convertAnthropicToOpenAIPayload(payload, model) {
         ? payload.system.map(s => s.text || '').join('\n')
         : '';
     if (systemText) {
-      messages.push({ role: 'system', content: systemText });
+      const role = reasoning ? 'developer' : 'system';
+      messages.push({ role, content: systemText });
     }
   }
 
@@ -388,14 +405,25 @@ function convertAnthropicToOpenAIPayload(payload, model) {
     }
   }
 
-  return {
+  const result = {
     model,
     messages,
     stream: payload.stream === true,
-    max_tokens: payload.max_tokens,
-    temperature: payload.temperature,
-    top_p: payload.top_p,
   };
+
+  const tokenLimit = payload.max_tokens || payload.max_completion_tokens;
+  if (tokenLimit) {
+    // Modelos modernos e modelos de raciocínio da OpenAI exigem max_completion_tokens
+    result.max_completion_tokens = tokenLimit;
+  }
+
+  // Modelos de raciocínio (o1, o3, etc.) na OpenAI proíbem temperature e top_p
+  if (!reasoning) {
+    if (payload.temperature !== undefined) result.temperature = payload.temperature;
+    if (payload.top_p !== undefined) result.top_p = payload.top_p;
+  }
+
+  return result;
 }
 
 function convertOpenAIToAnthropicResponse(openaiJson, model) {
@@ -440,8 +468,17 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
       ...payload,
       model
     };
+    if (isReasoningModel(model)) {
+      if (remotePayload.max_tokens !== undefined) {
+        if (!remotePayload.max_completion_tokens) {
+          remotePayload.max_completion_tokens = remotePayload.max_tokens;
+        }
+        delete remotePayload.max_tokens;
+      }
+      delete remotePayload.temperature;
+      delete remotePayload.top_p;
+    }
   }
-  const postData = JSON.stringify(remotePayload);
 
   const parsedUrl = new URL(provider.baseUrl.replace(/\/+$/, '') + targetPath);
   const isHttps = parsedUrl.protocol === 'https:';
@@ -450,7 +487,6 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
   const headers = {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${provider.apiKey}`,
-    'Content-Length': Buffer.byteLength(postData)
   };
 
   if (providerKey === 'openrouter') {
@@ -461,104 +497,137 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
     }
   }
 
-  const clientReq = transport.request(parsedUrl, {
-    method: 'POST',
-    headers,
-    timeout: 600000 // 10 minutos
-  }, remoteRes => {
-    // Caso 1: Passthrough direto (OpenRouter Anthropic nativo ou OpenAI -> OpenAI)
-    if (!isAnthropicToGenericOpenAI) {
-      const responseHeaders = { ...remoteRes.headers };
-      delete responseHeaders['content-length'];
-      res.writeHead(remoteRes.statusCode, responseHeaders);
-      remoteRes.pipe(res);
-      remoteRes.on('end', () => {
-        log(`✅ [${providerKey}] Resposta concluída com status ${remoteRes.statusCode}`);
-      });
-      return;
-    }
+  function sendRemoteRequest(payloadToSend, isRetry = false) {
+    const postData = JSON.stringify(payloadToSend);
+    headers['Content-Length'] = Buffer.byteLength(postData);
 
-    // Caso 2: Tradução de OpenAI genérico para cliente Anthropic (ex: Claude Code)
-    if (remoteRes.statusCode !== 200) {
-      const responseHeaders = { ...remoteRes.headers };
-      delete responseHeaders['content-length'];
-      res.writeHead(remoteRes.statusCode, responseHeaders);
-      remoteRes.pipe(res);
-      return;
-    }
-
-    if (!isStream) {
-      let rawData = '';
-      remoteRes.on('data', chunk => { rawData += chunk; });
-      remoteRes.on('end', () => {
-        try {
-          const json = JSON.parse(rawData);
-          const anthropicMsg = convertOpenAIToAnthropicResponse(json, model);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(anthropicMsg));
-        } catch (e) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: { message: `Erro ao converter resposta: ${e.message}` } }));
-        }
-        log(`✅ [${providerKey}] Resposta traduzida para Anthropic com sucesso`);
-      });
-    } else {
-      // Streaming SSE: traduz chunks OpenAI para chunks Anthropic
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      });
-
-      const msgId = `msg_${Date.now()}`;
-      res.write(`event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', model, content: [], usage: { input_tokens: 0, output_tokens: 0 } } })}\n\n`);
-      res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`);
-
-      let buffer = '';
-      remoteRes.on('data', chunk => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop(); // mantém linha incompleta no buffer
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data:')) continue;
-          const dataStr = trimmed.slice(5).trim();
-          if (dataStr === '[DONE]') continue;
-          try {
-            const parsedChunk = JSON.parse(dataStr);
-            const deltaText = parsedChunk.choices?.[0]?.delta?.content;
-            if (deltaText) {
-              res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: deltaText } })}\n\n`);
+    const clientReq = transport.request(parsedUrl, {
+      method: 'POST',
+      headers,
+      timeout: 600000 // 10 minutos
+    }, remoteRes => {
+      // Se a API retornar 400 por parâmetro incompatível (max_tokens / temperature), corrige e tenta novamente
+      if (remoteRes.statusCode === 400 && !isRetry) {
+        let errBody = '';
+        remoteRes.on('data', c => { errBody += c; });
+        remoteRes.on('end', () => {
+          if (errBody.includes('max_tokens') || errBody.includes('max_completion_tokens') || errBody.includes('temperature') || errBody.includes('top_p')) {
+            log(`⚠️  [${providerKey}] Parâmetro incompatível (${errBody.trim()}). Ajustando para max_completion_tokens e repetindo...`);
+            const retryPayload = { ...payloadToSend };
+            if (retryPayload.max_tokens !== undefined) {
+              retryPayload.max_completion_tokens = retryPayload.max_tokens;
+              delete retryPayload.max_tokens;
             }
-          } catch (_) {}
-        }
-      });
+            delete retryPayload.temperature;
+            delete retryPayload.top_p;
+            sendRemoteRequest(retryPayload, true);
+            return;
+          }
 
-      remoteRes.on('end', () => {
-        res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
-        res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } })}\n\n`);
-        res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
-        res.end();
-        log(`✅ [${providerKey}] Stream traduzido para Anthropic com sucesso`);
-      });
-    }
-  });
+          const responseHeaders = { ...remoteRes.headers };
+          delete responseHeaders['content-length'];
+          res.writeHead(400, responseHeaders);
+          res.end(errBody);
+        });
+        return;
+      }
 
-  clientReq.on('timeout', () => {
-    clientReq.destroy(new Error(`Timeout de 10 minutos excedido com ${providerKey}`));
-  });
+      // Caso 1: Passthrough direto (OpenRouter Anthropic nativo ou OpenAI -> OpenAI)
+      if (!isAnthropicToGenericOpenAI) {
+        const responseHeaders = { ...remoteRes.headers };
+        delete responseHeaders['content-length'];
+        res.writeHead(remoteRes.statusCode, responseHeaders);
+        remoteRes.pipe(res);
+        remoteRes.on('end', () => {
+          log(`✅ [${providerKey}] Resposta concluída com status ${remoteRes.statusCode}`);
+        });
+        return;
+      }
 
-  clientReq.on('error', err => {
-    log(`❌ [${providerKey}] Erro na conexão: ${err.message}`);
-    if (!res.headersSent) {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: `Erro ao conectar com ${providerKey}: ${err.message}` } }));
-    }
-  });
+      // Caso 2: Tradução de OpenAI genérico para cliente Anthropic (ex: Claude Code)
+      if (remoteRes.statusCode !== 200) {
+        const responseHeaders = { ...remoteRes.headers };
+        delete responseHeaders['content-length'];
+        res.writeHead(remoteRes.statusCode, responseHeaders);
+        remoteRes.pipe(res);
+        return;
+      }
 
-  clientReq.write(postData);
-  clientReq.end();
+      if (!isStream) {
+        let rawData = '';
+        remoteRes.on('data', chunk => { rawData += chunk; });
+        remoteRes.on('end', () => {
+          try {
+            const json = JSON.parse(rawData);
+            const anthropicMsg = convertOpenAIToAnthropicResponse(json, model);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(anthropicMsg));
+          } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: `Erro ao converter resposta: ${e.message}` } }));
+          }
+          log(`✅ [${providerKey}] Resposta traduzida para Anthropic com sucesso`);
+        });
+      } else {
+        // Streaming SSE: traduz chunks OpenAI para chunks Anthropic
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive'
+        });
+
+        const msgId = `msg_${Date.now()}`;
+        res.write(`event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', model, content: [], usage: { input_tokens: 0, output_tokens: 0 } } })}\n\n`);
+        res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`);
+
+        let buffer = '';
+        remoteRes.on('data', chunk => {
+          buffer += chunk.toString();
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // mantém linha incompleta no buffer
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || !trimmed.startsWith('data:')) continue;
+            const dataStr = trimmed.slice(5).trim();
+            if (dataStr === '[DONE]') continue;
+            try {
+              const parsedChunk = JSON.parse(dataStr);
+              const deltaText = parsedChunk.choices?.[0]?.delta?.content;
+              if (deltaText) {
+                res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: deltaText } })}\n\n`);
+              }
+            } catch (_) {}
+          }
+        });
+
+        remoteRes.on('end', () => {
+          res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+          res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } })}\n\n`);
+          res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+          res.end();
+          log(`✅ [${providerKey}] Stream traduzido para Anthropic com sucesso`);
+        });
+      }
+    });
+
+    clientReq.on('timeout', () => {
+      clientReq.destroy(new Error(`Timeout de 10 minutos excedido com ${providerKey}`));
+    });
+
+    clientReq.on('error', err => {
+      log(`❌ [${providerKey}] Erro na conexão: ${err.message}`);
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: `Erro ao conectar com ${providerKey}: ${err.message}` } }));
+      }
+    });
+
+    clientReq.write(postData);
+    clientReq.end();
+  }
+
+  sendRemoteRequest(remotePayload);
 }
 
 const server = http.createServer((req, res) => {
