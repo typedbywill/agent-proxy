@@ -1,0 +1,16 @@
+[Unit]
+Description=Antigravity OpenAI-Compatible Proxy (agent-proxy)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/william/.local/bin/agent-proxy-server
+Restart=always
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=AGENT_PROXY_PORT=8080
+StandardOutput=append:/home/william/.agent-proxy.log
+StandardError=append:/home/william/.agent-proxy.log
+
+[Install]
+WantedBy=default.target

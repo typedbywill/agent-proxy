@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+#
+# agent-proxy: Gerenciador de ciclo de vida do proxy Antigravity + Provedores Externos
+# Integrado nativamente com o systemd user service do WillOS.
+#
+
+set -euo pipefail
+
+PORT="${AGENT_PROXY_PORT:-8080}"
+SERVICE_NAME="agent-proxy.service"
+LOG_FILE="$HOME/.agent-proxy.log"
+CONFIG_FILE="$HOME/.config/agent-proxy/providers.json"
+
+show_status() {
+  if systemctl --user is-active --quiet "$SERVICE_NAME"; then
+    local pid
+    pid=$(systemctl --user show --property=MainPID --value "$SERVICE_NAME")
+    echo "🟢 agent-proxy está RODANDO (PID: $pid) em http://127.0.0.1:$PORT/v1"
+    if curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+      local health_json
+      health_json=$(curl -s "http://127.0.0.1:$PORT/health")
+      local active_prov
+      local active_model
+      local providers
+      active_prov=$(echo "$health_json" | jq -r '.active.provider // "antigravity"')
+      active_model=$(echo "$health_json" | jq -r '.active.model // "gemini-3.8-flash-medium"')
+      providers=$(echo "$health_json" | jq -r '.providers | join(", ")')
+      echo "✨ Health check: OK"
+      echo "🎯 Modelo Coringa 'ai-proxy' aponta para: [$active_prov] -> $active_model"
+      echo "🔌 Provedores disponíveis: $providers"
+    fi
+  else
+    echo "🔴 agent-proxy está PARADO"
+  fi
+}
+
+start_proxy() {
+  if systemctl --user is-active --quiet "$SERVICE_NAME"; then
+    echo "⚠️  agent-proxy já está em execução."
+    show_status
+    return 0
+  fi
+
+  echo "🚀 Subindo agent-proxy..."
+  systemctl --user start "$SERVICE_NAME"
+  sleep 1
+
+  if systemctl --user is-active --quiet "$SERVICE_NAME"; then
+    local pid
+    pid=$(systemctl --user show --property=MainPID --value "$SERVICE_NAME")
+    echo "✅ agent-proxy iniciado com sucesso! (PID: $pid)"
+    echo "   🔗 OpenAI / Anthropic Base URL: http://127.0.0.1:$PORT/v1"
+    echo "   📜 Logs: $LOG_FILE"
+  else
+    echo "❌ Falha ao iniciar agent-proxy. Verifique os logs:"
+    journalctl --user -u "$SERVICE_NAME" -n 15 --no-pager
+    return 1
+  fi
+}
+
+stop_proxy() {
+  if ! systemctl --user is-active --quiet "$SERVICE_NAME"; then
+    echo "ℹ️  agent-proxy já está parado."
+    return 0
+  fi
+
+  echo "🛑 Derrubando agent-proxy..."
+  systemctl --user stop "$SERVICE_NAME"
+  echo "✅ agent-proxy foi encerrado."
+}
+
+restart_proxy() {
+  echo "🔄 Reiniciando agent-proxy..."
+  systemctl --user restart "$SERVICE_NAME"
+  sleep 1
+  show_status
+}
+
+show_logs() {
+  if [ -f "$LOG_FILE" ]; then
+    tail -f -n 30 "$LOG_FILE"
+  else
+    journalctl --user -u "$SERVICE_NAME" -f -n 30
+  fi
+}
+
+edit_config() {
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  ${EDITOR:-nano} "$CONFIG_FILE"
+}
+
+set_provider_key() {
+  local provider="${1:-}"
+  local key="${2:-}"
+
+  if [ -z "$provider" ] || [ -z "$key" ]; then
+    echo "Uso: agent-proxy set-key <provedor> <sua-api-key>"
+    echo "Exemplo: agent-proxy set-key openrouter sk-or-v1-..."
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  node -e "
+    const fs = require('fs');
+    const path = '$CONFIG_FILE';
+    let data = { active: { provider: 'antigravity', model: 'gemini-3.8-flash-medium' }, providers: {} };
+    try { data = JSON.parse(fs.readFileSync(path, 'utf8')); } catch (_) {}
+    if (!data.providers) data.providers = {};
+    if (!data.providers['$provider']) {
+      data.providers['$provider'] = {
+        type: 'openai-compatible',
+        baseUrl: '$provider' === 'openrouter' ? 'https://openrouter.ai/api/v1' : 'https://api.openai.com/v1',
+        apiKey: '',
+        models: []
+      };
+    }
+    data.providers['$provider'].apiKey = '$key';
+    fs.writeFileSync(path, JSON.stringify(data, null, 2));
+    console.log('✅ Chave para ' + '$provider' + ' salva com sucesso em ' + path);
+  "
+
+  if systemctl --user is-active --quiet "$SERVICE_NAME"; then
+    restart_proxy
+  fi
+}
+
+set_active_model() {
+  local provider="${1:-}"
+  local model="${2:-}"
+
+  if [ -z "$provider" ]; then
+    echo "Uso: agent-proxy use <provedor> [modelo]"
+    echo ""
+    echo "Exemplos:"
+    echo "  agent-proxy use antigravity gemini-3.8-flash-medium"
+    echo "  agent-proxy use antigravity claude-sonnet-5-5-high"
+    echo "  agent-proxy use openrouter deepseek/deepseek-r1"
+    echo "  agent-proxy use openrouter meta-llama/llama-3.3-70b-instruct"
+    return 1
+  fi
+
+  if [ -z "$model" ]; then
+    if [ "$provider" = "antigravity" ]; then
+      model="gemini-3.8-flash-medium"
+    elif [ "$provider" = "openrouter" ]; then
+      model="deepseek/deepseek-chat"
+    else
+      model="default"
+    fi
+  fi
+
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  node -e "
+    const fs = require('fs');
+    const path = '$CONFIG_FILE';
+    let data = { active: {}, providers: {} };
+    try { data = JSON.parse(fs.readFileSync(path, 'utf8')); } catch (_) {}
+    data.active = { provider: '$provider', model: '$model' };
+    fs.writeFileSync(path, JSON.stringify(data, null, 2));
+    console.log('🎯 Modelo coringa \"ai-proxy\" agora direciona para: [$provider] -> $model');
+  "
+
+  # Sincroniza também no ~/.claude/settings.json se aplicável
+  local claude_settings="$HOME/.claude/settings.json"
+  if [ -f "$claude_settings" ]; then
+    node -e "
+      const fs = require('fs');
+      try {
+        const s = JSON.parse(fs.readFileSync('$claude_settings', 'utf8') || '{}');
+        s.model = 'ai-proxy';
+        fs.writeFileSync('$claude_settings', JSON.stringify(s, null, 2));
+      } catch (_) {}
+    "
+  fi
+
+  if systemctl --user is-active --quiet "$SERVICE_NAME"; then
+    restart_proxy
+  fi
+}
+
+show_help() {
+  echo "=========================================================="
+  echo "  agent-proxy: Bridge Antigravity + Provedores Externos"
+  echo "=========================================================="
+  echo ""
+  echo "Uso: agent-proxy <comando>"
+  echo ""
+  echo "Comandos disponíveis:"
+  echo "  use <prov> [model]   Altera o destino do modelo coringa 'ai-proxy'"
+  echo "  status               Exibe status, porta e destino ativo do 'ai-proxy'"
+  echo "  up | start           Sobe o proxy em segundo plano"
+  echo "  down | stop          Derruba o proxy"
+  echo "  restart              Reinicia o proxy"
+  echo "  logs                 Acompanha os logs em tempo real"
+  echo "  config               Abre o arquivo providers.json para edição"
+  echo "  set-key <prov> <key> Configura a chave de API de um provedor"
+  echo "  help                 Mostra este guia"
+  echo ""
+  echo "Como funciona o modelo 'ai-proxy':"
+  echo "  1. No Cursor IDE e no Claude Code, configure o modelo como: ai-proxy"
+  echo "  2. No terminal, quando quiser mudar o cérebro por trás de tudo, use:"
+  echo "     agent-proxy use antigravity gemini-3.8-flash-medium"
+  echo "     agent-proxy use openrouter deepseek/deepseek-r1"
+  echo "  3. Automaticamente, as próximas requisições do Cursor IDE e do Claude"
+  echo "     serão processadas pelo novo provedor escolhido!"
+  echo "=========================================================="
+}
+
+case "${1:-status}" in
+  up|start)
+    start_proxy
+    ;;
+  down|stop)
+    stop_proxy
+    ;;
+  restart)
+    restart_proxy
+    ;;
+  status)
+    show_status
+    ;;
+  logs)
+    show_logs
+    ;;
+  config)
+    edit_config
+    ;;
+  set-key)
+    shift
+    set_provider_key "$@"
+    ;;
+  use)
+    shift
+    set_active_model "$@"
+    ;;
+  help|--help|-h)
+    show_help
+    ;;
+  *)
+    echo "Comando desconhecido: $1"
+    echo ""
+    show_help
+    exit 1
+    ;;
+esac

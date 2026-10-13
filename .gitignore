@@ -1,0 +1,5 @@
+node_modules/
+.agent-proxy.log
+.agent-proxy.pid
+*.log
+.DS_Store

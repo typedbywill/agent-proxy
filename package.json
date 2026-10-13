@@ -1,0 +1,30 @@
+{
+  "name": "agent-proxy",
+  "version": "1.0.0",
+  "description": "Unified OpenAI & Anthropic-compatible AI Proxy bridging tools (Cursor IDE, Claude Code) to Antigravity CLI and Remote Providers (OpenRouter, Groq, Ollama)",
+  "main": "src/server.js",
+  "bin": {
+    "agent-proxy": "bin/agent-proxy",
+    "agent-proxy-server": "src/server.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "up": "bin/agent-proxy up",
+    "down": "bin/agent-proxy down",
+    "restart": "bin/agent-proxy restart",
+    "status": "bin/agent-proxy status",
+    "logs": "bin/agent-proxy logs"
+  },
+  "keywords": [
+    "ai",
+    "proxy",
+    "cursor",
+    "claude-code",
+    "antigravity",
+    "openrouter",
+    "gemini",
+    "deepseek"
+  ],
+  "author": "William Gerhard Bueno <williamgerhardbueno@gmail.com>",
+  "license": "MIT"
+}
