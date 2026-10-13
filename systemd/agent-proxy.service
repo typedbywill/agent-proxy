@@ -1,5 +1,5 @@
 [Unit]
-Description=Antigravity OpenAI-Compatible Proxy (agent-proxy)
+Description=Antigravity OpenAI & Anthropic-Compatible Proxy (agent-proxy)
 After=network.target
 
 [Service]
