@@ -45,9 +45,22 @@ function log(msg) {
   const timestamp = new Date().toLocaleTimeString('pt-BR');
   const line = `[${timestamp}] ${msg}\n`;
   process.stdout.write(line);
+
+  // Evita duplicação quando stdout já estiver redirecionado para o arquivo de log (ex: via systemd)
+  let isStdoutLogFile = false;
   try {
-    fs.appendFileSync(LOG_FILE, line);
+    const stdoutStat = fs.fstatSync(1);
+    if (fs.existsSync(LOG_FILE)) {
+      const fileStat = fs.statSync(LOG_FILE);
+      isStdoutLogFile = (stdoutStat.ino === fileStat.ino && stdoutStat.dev === fileStat.dev);
+    }
   } catch (_) {}
+
+  if (!isStdoutLogFile) {
+    try {
+      fs.appendFileSync(LOG_FILE, line);
+    } catch (_) {}
+  }
 }
 
 function loadConfig() {
@@ -237,6 +250,26 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
       res.write(`data: ${JSON.stringify(initialChunk)}\n\n`);
     }
 
+    // Heartbeat keep-alive para evitar timeout em clientes HTTP (ex: Claude Code / Cursor)
+    const pingInterval = setInterval(() => {
+      if (res.writableEnded || res.destroyed) {
+        clearInterval(pingInterval);
+        return;
+      }
+      if (apiFormat === 'anthropic') {
+        res.write(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`);
+      } else {
+        res.write(': ping\n\n');
+      }
+    }, 5000);
+
+    res.on('close', () => {
+      clearInterval(pingInterval);
+      if (!proc.killed) {
+        try { proc.kill('SIGTERM'); } catch (_) {}
+      }
+    });
+
     proc.stdout.on('data', chunk => {
       const text = chunk.toString();
       if (!text) return;
@@ -256,6 +289,7 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
     });
 
     proc.on('close', code => {
+      clearInterval(pingInterval);
       if (code !== 0 && !sentAnyChunk && stderrOutput) {
         let cleanErr = stderrOutput.trim();
         try {
@@ -366,7 +400,8 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
 
   const clientReq = transport.request(parsedUrl, {
     method: 'POST',
-    headers
+    headers,
+    timeout: 600000 // 10 minutos
   }, remoteRes => {
     const responseHeaders = { ...remoteRes.headers };
     delete responseHeaders['content-length'];
@@ -377,6 +412,10 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
     remoteRes.on('end', () => {
       log(`✅ [${providerKey}] Resposta concluída com status ${remoteRes.statusCode}`);
     });
+  });
+
+  clientReq.on('timeout', () => {
+    clientReq.destroy(new Error(`Timeout de 10 minutos excedido com ${providerKey}`));
   });
 
   clientReq.on('error', err => {
@@ -420,6 +459,8 @@ const server = http.createServer((req, res) => {
   const isOpenAIChat = url === '/v1/chat/completions' || url === '/chat/completions';
 
   if (req.method === 'POST' && (isOpenAIChat || isAnthropic)) {
+    req.socket.setTimeout(0);
+    res.setTimeout(0);
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
@@ -466,6 +507,12 @@ const server = http.createServer((req, res) => {
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: 'Not found', code: 404 } }));
 });
+
+// Desativa limites de timeout no servidor para suportar requisições demoradas
+server.requestTimeout = 0;
+server.headersTimeout = 0;
+server.keepAliveTimeout = 65000;
+server.timeout = 0;
 
 server.listen(PORT, HOST, () => {
   log(`🚀 agent-proxy ativo em http://${HOST}:${PORT}`);

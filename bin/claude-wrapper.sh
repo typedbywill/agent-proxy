@@ -7,6 +7,11 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
 export ANTHROPIC_API_KEY="sk-antigravity"
 export ANTHROPIC_MODEL="ai-proxy"
 export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1
+
+# Timeouts estendidos para evitar erros ao processar prompts longos ou modelos de raciocínio
+export API_TIMEOUT_MS=600000                       # 10 minutos para a requisição geral
+export CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=300000  # 5 minutos aguardando o primeiro chunk
+export CLAUDE_STREAM_IDLE_TIMEOUT_MS=300000        # 5 minutos de inatividade entre chunks
 unset ANTHROPIC_AUTH_TOKEN
 
 # Se o proxy não estiver rodando, sobe imediatamente
