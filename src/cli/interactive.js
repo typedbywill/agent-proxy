@@ -135,6 +135,72 @@ function select({ message, choices = [], initialIndex = 0 }) {
   });
 }
 
+/**
+ * Solicita uma entrada de texto interativa ao usuário via terminal.
+ *
+ * @param {Object} options
+ * @param {string} options.message Mensagem/título do prompt
+ * @param {string} [options.defaultValue=''] Valor padrão sugerido
+ * @param {boolean} [options.allowEmpty=false] Se permite entrada vazia
+ * @param {Function} [options.validate] Função de validação opcional
+ * @returns {Promise<string|null>} O valor digitado, ou null se cancelado/vazio
+ */
+function input({ message, defaultValue = '', allowEmpty = false, validate } = {}) {
+  return new Promise((resolve) => {
+    if (!process.stdin.isTTY) {
+      return resolve(defaultValue || null);
+    }
+
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
+    const defaultHint = defaultValue ? ` ${color.dim(`(padrão: ${defaultValue})`)}` : '';
+    const cancelHint = !allowEmpty ? ` ${color.dim('(Enter vazio para cancelar)')}` : '';
+    const promptMessage = `${color.bold(color.cyan('?'))} ${color.bold(message)}${defaultHint}${cancelHint} `;
+
+    let isClosed = false;
+    const cleanupAndResolve = (val) => {
+      if (isClosed) return;
+      isClosed = true;
+      rl.close();
+      resolve(val);
+    };
+
+    rl.once('SIGINT', () => {
+      process.stdout.write('\n' + color.dim('Operação cancelada.') + '\n');
+      cleanupAndResolve(null);
+    });
+
+    function ask() {
+      rl.question(promptMessage, (answer) => {
+        const val = answer.trim() || defaultValue;
+        if (!val && !allowEmpty) {
+          process.stdout.write(color.dim('Operação cancelada.') + '\n');
+          cleanupAndResolve(null);
+          return;
+        }
+
+        if (val && typeof validate === 'function') {
+          const res = validate(val);
+          if (res !== true) {
+            const errorMsg = typeof res === 'string' ? res : 'Valor inválido.';
+            process.stdout.write(`${symbols.cross} ${color.red(errorMsg)}\n`);
+            ask();
+            return;
+          }
+        }
+
+        cleanupAndResolve(val || null);
+      });
+    }
+
+    ask();
+  });
+}
+
 module.exports = {
   select,
+  input,
 };

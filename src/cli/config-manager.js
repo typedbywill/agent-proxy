@@ -113,9 +113,14 @@ function setActive(provider, model) {
       type: provider === 'antigravity' ? 'cli' : 'openai-compatible',
       models: [model]
     };
-  } else if (model && Array.isArray(config.providers[provider].models) && !config.providers[provider].models.includes(model)) {
-    // Se for um modelo novo não listado, adiciona à lista
-    config.providers[provider].models.push(model);
+  } else if (model) {
+    if (!Array.isArray(config.providers[provider].models)) {
+      config.providers[provider].models = provider === 'antigravity' ? [...DEFAULT_ANTIGRAVITY_MODELS] : [];
+    }
+    if (!config.providers[provider].models.includes(model)) {
+      // Se for um modelo novo não listado, adiciona à lista
+      config.providers[provider].models.push(model);
+    }
   }
 
   config.active = {

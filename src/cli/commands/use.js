@@ -1,9 +1,50 @@
 'use strict';
 
-const { select } = require('../interactive');
+const { select, input } = require('../interactive');
 const { color, symbols } = require('../formatting');
 const configManager = require('../config-manager');
 const systemd = require('../systemd');
+
+/**
+ * Exibe seleção de modelo para o provedor ou solicita digitação de modelo personalizado.
+ */
+async function selectOrInputModel(providerName, availableModels, currentActiveModel) {
+  if (availableModels.length === 0) {
+    console.log(`${symbols.warn} Provedor ${color.magenta(providerName)} não possui modelos pré-cadastrados.`);
+    return await input({
+      message: `Digite o nome do modelo para [${providerName}]:`,
+    });
+  }
+
+  const choices = availableModels.map((m) => ({
+    label: m,
+    value: m,
+    hint: currentActiveModel === m ? 'ativo' : undefined,
+  }));
+
+  choices.push({
+    label: 'Personalizado (digitar outro modelo)',
+    value: '__custom__',
+    hint: 'manual',
+  });
+
+  const defaultIdx = Math.max(0, availableModels.indexOf(currentActiveModel));
+  const chosen = await select({
+    message: `Escolha o Modelo em [${color.magenta(providerName)}]:`,
+    choices,
+    initialIndex: defaultIdx !== -1 ? defaultIdx : 0,
+  });
+
+  if (!chosen) return null;
+
+  if (chosen === '__custom__') {
+    return await input({
+      message: `Digite o nome do modelo para [${providerName}]:`,
+    });
+  }
+
+  return chosen;
+}
 
 async function handleUse(args = []) {
   const [firstArg, secondArg] = args;
@@ -34,30 +75,11 @@ async function handleUse(args = []) {
       const providerConfig = providers[providerArg];
       const availableModels = providerConfig?.models || (providerArg === 'antigravity' ? configManager.DEFAULT_ANTIGRAVITY_MODELS : []);
 
-      if (availableModels.length === 0) {
-        console.log();
-        console.error(`${symbols.cross} ${color.red(`Provedor '${providerArg}' não possui modelos cadastrados.`)}`);
-        console.log(`${color.yellow('Dica:')} Especifique o modelo: ${color.cyan(`agent-proxy use ${providerArg} <nome-do-modelo>`)}`);
-        console.log();
-        process.exitCode = 1;
-        return;
-      }
-
-      // Se houver TTY, abre seletor interativo para os modelos do provedor
+      // Se houver TTY, abre seletor interativo para os modelos do provedor (com opção personalizada)
       if (process.stdin.isTTY) {
         console.log();
-        const choices = availableModels.map((m) => ({
-          label: m,
-          value: m,
-          hint: currentActive.provider === providerArg && currentActive.model === m ? 'ativo' : undefined,
-        }));
-
-        const defaultIdx = Math.max(0, availableModels.indexOf(currentActive.model));
-        const chosenModel = await select({
-          message: `Selecione o modelo para o provedor ${color.magenta(providerArg)}:`,
-          choices,
-          initialIndex: defaultIdx !== -1 ? defaultIdx : 0,
-        });
+        const activeModelForProv = currentActive.provider === providerArg ? currentActive.model : null;
+        const chosenModel = await selectOrInputModel(providerArg, availableModels, activeModelForProv);
 
         if (!chosenModel) return;
 
@@ -72,6 +94,14 @@ async function handleUse(args = []) {
         console.log();
         return;
       } else {
+        if (availableModels.length === 0) {
+          console.log();
+          console.error(`${symbols.cross} ${color.red(`Provedor '${providerArg}' não possui modelos cadastrados.`)}`);
+          console.log(`${color.yellow('Dica:')} Especifique o modelo: ${color.cyan(`agent-proxy use ${providerArg} <nome-do-modelo>`)}`);
+          console.log();
+          process.exitCode = 1;
+          return;
+        }
         // Sem TTY: escolhe o primeiro modelo cadastrado
         const fallbackModel = availableModels[0];
         const updated = configManager.setActive(providerArg, fallbackModel);
@@ -160,37 +190,16 @@ async function handleUse(args = []) {
 
   if (!chosenProvider) return;
 
-  // Passo 2: Escolher Modelo do Provedor Selecionado
+  // Passo 2: Escolher Modelo do Provedor Selecionado (com opção de modelo personalizado)
   const providerConfig = providers[chosenProvider];
   let availableModels = providerConfig?.models || [];
 
-  if (availableModels.length === 0) {
-    if (chosenProvider === 'antigravity') {
-      availableModels = configManager.DEFAULT_ANTIGRAVITY_MODELS;
-    } else {
-      console.log(`${symbols.warn} Provedor ${chosenProvider} não possui modelos pré-cadastrados.`);
-      console.log(`${color.yellow('Dica:')} Use ${color.cyan(`agent-proxy use ${chosenProvider} <modelo>`)} para cadastrar e ativar.`);
-      return;
-    }
+  if (availableModels.length === 0 && chosenProvider === 'antigravity') {
+    availableModels = configManager.DEFAULT_ANTIGRAVITY_MODELS;
   }
 
-  const modelChoices = availableModels.map((m) => {
-    const isCurrent = currentActive.provider === chosenProvider && currentActive.model === m;
-    return {
-      label: m,
-      value: m,
-      hint: isCurrent ? 'ativo' : undefined,
-    };
-  });
-
-  let modelInitialIndex = availableModels.indexOf(currentActive.model);
-  if (modelInitialIndex === -1) modelInitialIndex = 0;
-
-  const chosenModel = await select({
-    message: `Escolha o Modelo em [${chosenProvider}]:`,
-    choices: modelChoices,
-    initialIndex: modelInitialIndex,
-  });
+  const activeModelForProv = currentActive.provider === chosenProvider ? currentActive.model : null;
+  const chosenModel = await selectOrInputModel(chosenProvider, availableModels, activeModelForProv);
 
   if (!chosenModel) return;
 
