@@ -379,9 +379,132 @@ function isReasoningModel(model) {
   );
 }
 
+function convertAnthropicToolsToOpenAI(anthropicTools) {
+  if (!Array.isArray(anthropicTools)) return undefined;
+  return anthropicTools.map(tool => ({
+    type: 'function',
+    function: {
+      name: tool.name,
+      description: tool.description || '',
+      parameters: tool.input_schema || { type: 'object', properties: {} }
+    }
+  }));
+}
+
+function convertAnthropicToolChoiceToOpenAI(toolChoice) {
+  if (!toolChoice) return undefined;
+  if (typeof toolChoice === 'string') return toolChoice;
+  if (toolChoice.type === 'auto') return 'auto';
+  if (toolChoice.type === 'any') return 'required';
+  if (toolChoice.type === 'none') return 'none';
+  if (toolChoice.type === 'tool' && toolChoice.name) {
+    return { type: 'function', function: { name: toolChoice.name } };
+  }
+  return undefined;
+}
+
+function convertAnthropicMessagesToOpenAI(messages, reasoning) {
+  const openAIMessages = [];
+
+  for (const m of messages) {
+    if (typeof m.content === 'string') {
+      openAIMessages.push({ role: m.role, content: m.content });
+      continue;
+    }
+
+    if (!Array.isArray(m.content)) {
+      openAIMessages.push({ role: m.role, content: String(m.content || '') });
+      continue;
+    }
+
+    if (m.role === 'assistant') {
+      let textContent = '';
+      const toolCalls = [];
+
+      for (const block of m.content) {
+        if (typeof block === 'string') {
+          textContent += block;
+        } else if (block.type === 'text') {
+          textContent += (block.text || '');
+        } else if (block.type === 'tool_use') {
+          toolCalls.push({
+            id: block.id || `call_${Date.now()}_${toolCalls.length}`,
+            type: 'function',
+            function: {
+              name: block.name,
+              arguments: typeof block.input === 'string' ? block.input : JSON.stringify(block.input || {})
+            }
+          });
+        }
+      }
+
+      const assistantMsg = {
+        role: 'assistant',
+        content: textContent || (toolCalls.length > 0 ? null : '')
+      };
+      if (toolCalls.length > 0) {
+        assistantMsg.tool_calls = toolCalls;
+      }
+      openAIMessages.push(assistantMsg);
+    } else if (m.role === 'user') {
+      const toolResults = [];
+      const userContentParts = [];
+
+      for (const block of m.content) {
+        if (typeof block === 'string') {
+          userContentParts.push({ type: 'text', text: block });
+        } else if (block.type === 'text') {
+          userContentParts.push({ type: 'text', text: block.text || '' });
+        } else if (block.type === 'image' && block.source?.data) {
+          userContentParts.push({
+            type: 'image_url',
+            image_url: {
+              url: `data:${block.source.media_type || 'image/png'};base64,${block.source.data}`
+            }
+          });
+        } else if (block.type === 'tool_result') {
+          toolResults.push(block);
+        }
+      }
+
+      // No OpenAI, respostas de ferramentas exigem role: 'tool' com tool_call_id
+      for (const tr of toolResults) {
+        let resultContent = tr.content;
+        if (Array.isArray(resultContent)) {
+          resultContent = resultContent
+            .map(c => (typeof c === 'string' ? c : c.text || JSON.stringify(c)))
+            .join('\n');
+        } else if (typeof resultContent !== 'string') {
+          resultContent = JSON.stringify(resultContent || '');
+        }
+        if (tr.is_error && !resultContent.startsWith('Error:')) {
+          resultContent = `Error: ${resultContent}`;
+        }
+        openAIMessages.push({
+          role: 'tool',
+          tool_call_id: tr.tool_use_id,
+          content: resultContent
+        });
+      }
+
+      if (userContentParts.length > 0) {
+        if (userContentParts.length === 1 && userContentParts[0].type === 'text') {
+          openAIMessages.push({ role: 'user', content: userContentParts[0].text });
+        } else {
+          openAIMessages.push({ role: 'user', content: userContentParts });
+        }
+      }
+    } else {
+      openAIMessages.push({ role: m.role, content: JSON.stringify(m.content) });
+    }
+  }
+
+  return openAIMessages;
+}
+
 function convertAnthropicToOpenAIPayload(payload, model) {
-  const messages = [];
   const reasoning = isReasoningModel(model);
+  const messages = [];
 
   if (payload.system) {
     const systemText = typeof payload.system === 'string'
@@ -396,13 +519,8 @@ function convertAnthropicToOpenAIPayload(payload, model) {
   }
 
   if (Array.isArray(payload.messages)) {
-    for (const m of payload.messages) {
-      let content = m.content;
-      if (Array.isArray(content)) {
-        content = content.map(b => (typeof b === 'string' ? b : b.text || b.content || '')).join('\n');
-      }
-      messages.push({ role: m.role, content: content || '' });
-    }
+    const converted = convertAnthropicMessagesToOpenAI(payload.messages, reasoning);
+    messages.push(...converted);
   }
 
   const result = {
@@ -411,13 +529,26 @@ function convertAnthropicToOpenAIPayload(payload, model) {
     stream: payload.stream === true,
   };
 
+  // Conversão de ferramentas (Tools)
+  if (Array.isArray(payload.tools) && payload.tools.length > 0) {
+    result.tools = convertAnthropicToolsToOpenAI(payload.tools);
+    if (payload.tool_choice) {
+      const tc = convertAnthropicToolChoiceToOpenAI(payload.tool_choice);
+      if (tc !== undefined) {
+        result.tool_choice = tc;
+      }
+    }
+    // Modelos com reasoning (ex: gpt-6-luna / o1) na OpenAI exigem reasoning_effort 'none' ao utilizar function tools no endpoint chat/completions
+    if (reasoning) {
+      result.reasoning_effort = 'none';
+    }
+  }
+
   const tokenLimit = payload.max_tokens || payload.max_completion_tokens;
   if (tokenLimit) {
-    // Modelos modernos e modelos de raciocínio da OpenAI exigem max_completion_tokens
     result.max_completion_tokens = tokenLimit;
   }
 
-  // Modelos de raciocínio (o1, o3, etc.) na OpenAI proíbem temperature e top_p
   if (!reasoning) {
     if (payload.temperature !== undefined) result.temperature = payload.temperature;
     if (payload.top_p !== undefined) result.top_p = payload.top_p;
@@ -428,14 +559,50 @@ function convertAnthropicToOpenAIPayload(payload, model) {
 
 function convertOpenAIToAnthropicResponse(openaiJson, model) {
   const choice = openaiJson.choices?.[0];
-  const text = choice?.message?.content || '';
+  const message = choice?.message || {};
+  const content = [];
+
+  if (message.content) {
+    content.push({ type: 'text', text: message.content });
+  }
+
+  if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+    for (const tc of message.tool_calls) {
+      let inputObj = {};
+      try {
+        inputObj = JSON.parse(tc.function?.arguments || '{}');
+      } catch (_) {
+        inputObj = { raw: tc.function?.arguments || '' };
+      }
+      content.push({
+        type: 'tool_use',
+        id: tc.id || `call_${Date.now()}`,
+        name: tc.function?.name || '',
+        input: inputObj
+      });
+    }
+  }
+
+  if (content.length === 0) {
+    content.push({ type: 'text', text: '' });
+  }
+
+  let stopReason = 'end_turn';
+  if (choice?.finish_reason === 'tool_calls' || (Array.isArray(message.tool_calls) && message.tool_calls.length > 0)) {
+    stopReason = 'tool_use';
+  } else if (choice?.finish_reason === 'length') {
+    stopReason = 'max_tokens';
+  } else if (choice?.finish_reason === 'stop') {
+    stopReason = 'end_turn';
+  }
+
   return {
     id: `msg_${openaiJson.id || Date.now()}`,
     type: 'message',
     role: 'assistant',
     model,
-    content: [{ type: 'text', text }],
-    stop_reason: choice?.finish_reason === 'stop' ? 'end_turn' : (choice?.finish_reason || 'end_turn'),
+    content,
+    stop_reason: stopReason,
     usage: {
       input_tokens: openaiJson.usage?.prompt_tokens || 0,
       output_tokens: openaiJson.usage?.completion_tokens || 0,
@@ -446,8 +613,10 @@ function convertOpenAIToAnthropicResponse(openaiJson, model) {
 function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
   const { providerKey, provider, model } = routeInfo;
   const isStream = payload.stream === true;
-  const isAnthropicToOpenRouter = apiFormat === 'anthropic' && providerKey === 'openrouter';
-  const isAnthropicToGenericOpenAI = apiFormat === 'anthropic' && providerKey !== 'openrouter';
+  // OpenRouter suporta endpoint nativo /messages apenas para modelos Claude Anthropic
+  const isAnthropicModel = model.startsWith('anthropic/');
+  const isAnthropicToOpenRouter = apiFormat === 'anthropic' && providerKey === 'openrouter' && isAnthropicModel;
+  const isAnthropicToGenericOpenAI = apiFormat === 'anthropic' && !isAnthropicToOpenRouter;
 
   const targetPath = isAnthropicToOpenRouter ? '/messages' : '/chat/completions';
   log(`🌐 [${providerKey}] Encaminhando modelo: ${model} para ${provider.baseUrl}${targetPath} (Formato: ${apiFormat}, Stream: ${isStream})`);
@@ -492,7 +661,7 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
   if (providerKey === 'openrouter') {
     headers['HTTP-Referer'] = 'https://github.com/typedbywill/WillOS';
     headers['X-Title'] = 'WillOS Agent Proxy';
-    if (apiFormat === 'anthropic') {
+    if (isAnthropicToOpenRouter) {
       headers['anthropic-version'] = '2023-06-01';
     }
   }
@@ -506,17 +675,26 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
       headers,
       timeout: 600000 // 10 minutos
     }, remoteRes => {
-      // Se a API retornar 400 por parâmetro incompatível (max_tokens / temperature), corrige e tenta novamente
+      // Se a API retornar 400 por parâmetro incompatível (max_tokens / temperature / reasoning_effort), corrige e tenta novamente
       if (remoteRes.statusCode === 400 && !isRetry) {
         let errBody = '';
         remoteRes.on('data', c => { errBody += c; });
         remoteRes.on('end', () => {
-          if (errBody.includes('max_tokens') || errBody.includes('max_completion_tokens') || errBody.includes('temperature') || errBody.includes('top_p')) {
-            log(`⚠️  [${providerKey}] Parâmetro incompatível (${errBody.trim()}). Ajustando para max_completion_tokens e repetindo...`);
+          if (
+            errBody.includes('max_tokens') ||
+            errBody.includes('max_completion_tokens') ||
+            errBody.includes('temperature') ||
+            errBody.includes('top_p') ||
+            errBody.includes('reasoning_effort')
+          ) {
+            log(`⚠️  [${providerKey}] Parâmetro incompatível (${errBody.trim()}). Ajustando e repetindo...`);
             const retryPayload = { ...payloadToSend };
             if (retryPayload.max_tokens !== undefined) {
               retryPayload.max_completion_tokens = retryPayload.max_tokens;
               delete retryPayload.max_tokens;
+            }
+            if (errBody.includes('reasoning_effort') || retryPayload.tools) {
+              retryPayload.reasoning_effort = 'none';
             }
             delete retryPayload.temperature;
             delete retryPayload.top_p;
@@ -569,7 +747,7 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
           log(`✅ [${providerKey}] Resposta traduzida para Anthropic com sucesso`);
         });
       } else {
-        // Streaming SSE: traduz chunks OpenAI para chunks Anthropic
+        // Streaming SSE: traduz chunks OpenAI para chunks Anthropic (com suporte completo a Tools)
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
@@ -578,7 +756,27 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
 
         const msgId = `msg_${Date.now()}`;
         res.write(`event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', model, content: [], usage: { input_tokens: 0, output_tokens: 0 } } })}\n\n`);
-        res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`);
+
+        let currentBlockIndex = 0;
+        let textBlockStarted = false;
+        let textBlockClosed = false;
+        const activeToolCalls = new Map(); // openaiIndex -> { anthropicIndex, id, name, started, closed }
+        let hasToolCalls = false;
+        let finishReason = null;
+
+        // Ping periódico keep-alive durante streaming para evitar timeout no Claude Code
+        const pingInterval = setInterval(() => {
+          if (res.writableEnded || res.destroyed) {
+            clearInterval(pingInterval);
+            return;
+          }
+          res.write(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`);
+        }, 5000);
+
+        res.on('close', () => {
+          clearInterval(pingInterval);
+          try { remoteRes.destroy(); } catch (_) {}
+        });
 
         let buffer = '';
         remoteRes.on('data', chunk => {
@@ -591,19 +789,131 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
             if (!trimmed || !trimmed.startsWith('data:')) continue;
             const dataStr = trimmed.slice(5).trim();
             if (dataStr === '[DONE]') continue;
+
             try {
               const parsedChunk = JSON.parse(dataStr);
-              const deltaText = parsedChunk.choices?.[0]?.delta?.content;
+              const choice = parsedChunk.choices?.[0];
+              if (!choice) continue;
+
+              if (choice.finish_reason) {
+                finishReason = choice.finish_reason;
+              }
+
+              // 1. Processar delta de texto
+              const deltaText = choice.delta?.content;
               if (deltaText) {
-                res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: deltaText } })}\n\n`);
+                if (!textBlockStarted) {
+                  res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: currentBlockIndex, content_block: { type: 'text', text: '' } })}\n\n`);
+                  textBlockStarted = true;
+                }
+                res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text: deltaText } })}\n\n`);
+              }
+
+              // 2. Processar delta de tool_calls
+              const deltaToolCalls = choice.delta?.tool_calls;
+              if (Array.isArray(deltaToolCalls) && deltaToolCalls.length > 0) {
+                hasToolCalls = true;
+
+                // Se havia bloco de texto aberto, encerra-o antes de abrir blocos de tool_use
+                if (textBlockStarted && !textBlockClosed) {
+                  res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: currentBlockIndex })}\n\n`);
+                  textBlockClosed = true;
+                  currentBlockIndex++;
+                }
+
+                for (const tc of deltaToolCalls) {
+                  const oIdx = tc.index !== undefined ? tc.index : 0;
+                  let toolState = activeToolCalls.get(oIdx);
+
+                  if (!toolState) {
+                    const toolBlockIndex = currentBlockIndex++;
+                    toolState = {
+                      anthropicIndex: toolBlockIndex,
+                      id: tc.id || `call_${Date.now()}_${oIdx}`,
+                      name: tc.function?.name || '',
+                      started: false,
+                      closed: false
+                    };
+                    activeToolCalls.set(oIdx, toolState);
+                  }
+
+                  if (tc.id) toolState.id = tc.id;
+                  if (tc.function?.name) toolState.name = tc.function.name;
+
+                  if (!toolState.started && toolState.name) {
+                    res.write(`event: content_block_start\ndata: ${JSON.stringify({
+                      type: 'content_block_start',
+                      index: toolState.anthropicIndex,
+                      content_block: {
+                        type: 'tool_use',
+                        id: toolState.id,
+                        name: toolState.name,
+                        input: {}
+                      }
+                    })}\n\n`);
+                    toolState.started = true;
+                  }
+
+                  if (tc.function?.arguments) {
+                    if (!toolState.started) {
+                      res.write(`event: content_block_start\ndata: ${JSON.stringify({
+                        type: 'content_block_start',
+                        index: toolState.anthropicIndex,
+                        content_block: {
+                          type: 'tool_use',
+                          id: toolState.id,
+                          name: toolState.name || 'tool',
+                          input: {}
+                        }
+                      })}\n\n`);
+                      toolState.started = true;
+                    }
+
+                    res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+                      type: 'content_block_delta',
+                      index: toolState.anthropicIndex,
+                      delta: {
+                        type: 'input_json_delta',
+                        partial_json: tc.function.arguments
+                      }
+                    })}\n\n`);
+                  }
+                }
               }
             } catch (_) {}
           }
         });
 
         remoteRes.on('end', () => {
-          res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
-          res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } })}\n\n`);
+          clearInterval(pingInterval);
+
+          if (textBlockStarted && !textBlockClosed) {
+            res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: currentBlockIndex })}\n\n`);
+            textBlockClosed = true;
+          }
+
+          for (const toolState of activeToolCalls.values()) {
+            if (toolState.started && !toolState.closed) {
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: toolState.anthropicIndex })}\n\n`);
+              toolState.closed = true;
+            }
+          }
+
+          if (!textBlockStarted && activeToolCalls.size === 0) {
+            res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`);
+            res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+          }
+
+          let stopReason = 'end_turn';
+          if (hasToolCalls || finishReason === 'tool_calls') {
+            stopReason = 'tool_use';
+          } else if (finishReason === 'length') {
+            stopReason = 'max_tokens';
+          } else if (finishReason === 'stop') {
+            stopReason = 'end_turn';
+          }
+
+          res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: stopReason }, usage: { output_tokens: 0 } })}\n\n`);
           res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
           res.end();
           log(`✅ [${providerKey}] Stream traduzido para Anthropic com sucesso`);
