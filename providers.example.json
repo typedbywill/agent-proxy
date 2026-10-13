@@ -1,0 +1,48 @@
+{
+  "active": {
+    "provider": "antigravity",
+    "model": "gemini-3.8-flash-medium"
+  },
+  "providers": {
+    "antigravity": {
+      "type": "cli",
+      "models": [
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-low",
+        "claude-sonnet-5-5-high",
+        "claude-sonnet-5-5-medium",
+        "claude-sonnet-5-5-low",
+        "claude-opus-5-5-high",
+        "claude-opus-5-5-medium",
+        "claude-opus-5-5-low",
+        "gpt-oss-120b-medium"
+      ]
+    },
+    "openrouter": {
+      "type": "openai-compatible",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "apiKey": "",
+      "models": [
+        "openrouter/auto",
+        "deepseek/deepseek-chat",
+        "deepseek/deepseek-r1",
+        "meta-llama/llama-3.3-70b-instruct",
+        "google/gemini-2.0-flash-001"
+      ]
+    },
+    "openai": {
+      "type": "openai-compatible",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "",
+      "models": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o1",
+        "o1-mini",
+        "o3-mini",
+        "gpt-4-turbo"
+      ]
+    }
+  }
+}
