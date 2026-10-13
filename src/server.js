@@ -364,10 +364,65 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
   }
 }
 
+function convertAnthropicToOpenAIPayload(payload, model) {
+  const messages = [];
+
+  if (payload.system) {
+    const systemText = typeof payload.system === 'string'
+      ? payload.system
+      : Array.isArray(payload.system)
+        ? payload.system.map(s => s.text || '').join('\n')
+        : '';
+    if (systemText) {
+      messages.push({ role: 'system', content: systemText });
+    }
+  }
+
+  if (Array.isArray(payload.messages)) {
+    for (const m of payload.messages) {
+      let content = m.content;
+      if (Array.isArray(content)) {
+        content = content.map(b => (typeof b === 'string' ? b : b.text || b.content || '')).join('\n');
+      }
+      messages.push({ role: m.role, content: content || '' });
+    }
+  }
+
+  return {
+    model,
+    messages,
+    stream: payload.stream === true,
+    max_tokens: payload.max_tokens,
+    temperature: payload.temperature,
+    top_p: payload.top_p,
+  };
+}
+
+function convertOpenAIToAnthropicResponse(openaiJson, model) {
+  const choice = openaiJson.choices?.[0];
+  const text = choice?.message?.content || '';
+  return {
+    id: `msg_${openaiJson.id || Date.now()}`,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content: [{ type: 'text', text }],
+    stop_reason: choice?.finish_reason === 'stop' ? 'end_turn' : (choice?.finish_reason || 'end_turn'),
+    usage: {
+      input_tokens: openaiJson.usage?.prompt_tokens || 0,
+      output_tokens: openaiJson.usage?.completion_tokens || 0,
+    }
+  };
+}
+
 function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
   const { providerKey, provider, model } = routeInfo;
   const isStream = payload.stream === true;
-  log(`🌐 [${providerKey}] Encaminhando modelo: ${model} para ${provider.baseUrl} (Stream: ${isStream})`);
+  const isAnthropicToOpenRouter = apiFormat === 'anthropic' && providerKey === 'openrouter';
+  const isAnthropicToGenericOpenAI = apiFormat === 'anthropic' && providerKey !== 'openrouter';
+
+  const targetPath = isAnthropicToOpenRouter ? '/messages' : '/chat/completions';
+  log(`🌐 [${providerKey}] Encaminhando modelo: ${model} para ${provider.baseUrl}${targetPath} (Formato: ${apiFormat}, Stream: ${isStream})`);
 
   if (!provider.apiKey) {
     const errorMsg = `API Key do provedor '${providerKey}' não configurada em ~/.config/agent-proxy/providers.json!`;
@@ -377,13 +432,18 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
     return;
   }
 
-  const remotePayload = {
-    ...payload,
-    model
-  };
+  let remotePayload;
+  if (isAnthropicToGenericOpenAI) {
+    remotePayload = convertAnthropicToOpenAIPayload(payload, model);
+  } else {
+    remotePayload = {
+      ...payload,
+      model
+    };
+  }
   const postData = JSON.stringify(remotePayload);
 
-  const parsedUrl = new URL(provider.baseUrl.replace(/\/+$/, '') + '/chat/completions');
+  const parsedUrl = new URL(provider.baseUrl.replace(/\/+$/, '') + targetPath);
   const isHttps = parsedUrl.protocol === 'https:';
   const transport = isHttps ? https : http;
 
@@ -396,6 +456,9 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
   if (providerKey === 'openrouter') {
     headers['HTTP-Referer'] = 'https://github.com/typedbywill/WillOS';
     headers['X-Title'] = 'WillOS Agent Proxy';
+    if (apiFormat === 'anthropic') {
+      headers['anthropic-version'] = '2023-06-01';
+    }
   }
 
   const clientReq = transport.request(parsedUrl, {
@@ -403,15 +466,83 @@ function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {
     headers,
     timeout: 600000 // 10 minutos
   }, remoteRes => {
-    const responseHeaders = { ...remoteRes.headers };
-    delete responseHeaders['content-length'];
-    res.writeHead(remoteRes.statusCode, responseHeaders);
+    // Caso 1: Passthrough direto (OpenRouter Anthropic nativo ou OpenAI -> OpenAI)
+    if (!isAnthropicToGenericOpenAI) {
+      const responseHeaders = { ...remoteRes.headers };
+      delete responseHeaders['content-length'];
+      res.writeHead(remoteRes.statusCode, responseHeaders);
+      remoteRes.pipe(res);
+      remoteRes.on('end', () => {
+        log(`✅ [${providerKey}] Resposta concluída com status ${remoteRes.statusCode}`);
+      });
+      return;
+    }
 
-    remoteRes.pipe(res);
+    // Caso 2: Tradução de OpenAI genérico para cliente Anthropic (ex: Claude Code)
+    if (remoteRes.statusCode !== 200) {
+      const responseHeaders = { ...remoteRes.headers };
+      delete responseHeaders['content-length'];
+      res.writeHead(remoteRes.statusCode, responseHeaders);
+      remoteRes.pipe(res);
+      return;
+    }
 
-    remoteRes.on('end', () => {
-      log(`✅ [${providerKey}] Resposta concluída com status ${remoteRes.statusCode}`);
-    });
+    if (!isStream) {
+      let rawData = '';
+      remoteRes.on('data', chunk => { rawData += chunk; });
+      remoteRes.on('end', () => {
+        try {
+          const json = JSON.parse(rawData);
+          const anthropicMsg = convertOpenAIToAnthropicResponse(json, model);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(anthropicMsg));
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: `Erro ao converter resposta: ${e.message}` } }));
+        }
+        log(`✅ [${providerKey}] Resposta traduzida para Anthropic com sucesso`);
+      });
+    } else {
+      // Streaming SSE: traduz chunks OpenAI para chunks Anthropic
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      });
+
+      const msgId = `msg_${Date.now()}`;
+      res.write(`event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', model, content: [], usage: { input_tokens: 0, output_tokens: 0 } } })}\n\n`);
+      res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`);
+
+      let buffer = '';
+      remoteRes.on('data', chunk => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // mantém linha incompleta no buffer
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data:')) continue;
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr === '[DONE]') continue;
+          try {
+            const parsedChunk = JSON.parse(dataStr);
+            const deltaText = parsedChunk.choices?.[0]?.delta?.content;
+            if (deltaText) {
+              res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: deltaText } })}\n\n`);
+            }
+          } catch (_) {}
+        }
+      });
+
+      remoteRes.on('end', () => {
+        res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+        res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } })}\n\n`);
+        res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+        res.end();
+        log(`✅ [${providerKey}] Stream traduzido para Anthropic com sucesso`);
+      });
+    }
   });
 
   clientReq.on('timeout', () => {
