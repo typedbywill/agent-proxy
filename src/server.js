@@ -26,7 +26,7 @@ const AGY_BIN = process.env.AGY_BIN || path.join(os.homedir(), '.local/bin/agy')
 const LOG_FILE = process.env.AGENT_PROXY_LOG || path.join(os.homedir(), '.agent-proxy.log');
 const CONFIG_FILE = process.env.AGENT_PROXY_CONFIG || path.join(os.homedir(), '.config/agent-proxy/providers.json');
 
-const ALIAS_MODEL_NAMES = ['ai-proxy', 'default', 'custom', 'auto'];
+const ALIAS_MODEL_NAMES = ['ai-proxy', 'agent-proxy', 'default', 'custom', 'auto'];
 
 const DEFAULT_ANTIGRAVITY_MODELS = [
   'gemini-3.8-flash-high',
@@ -207,6 +207,15 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
 
   const proc = spawn(AGY_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
+  let stderrOutput = '';
+  let sentAnyChunk = false;
+
+  proc.stderr.on('data', errData => {
+    const text = errData.toString();
+    stderrOutput += text;
+    log(`⚠️  [agy stderr]: ${text.trim()}`);
+  });
+
   if (isStream) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -230,6 +239,8 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
 
     proc.stdout.on('data', chunk => {
       const text = chunk.toString();
+      if (!text) return;
+      sentAnyChunk = true;
       if (apiFormat === 'anthropic') {
         res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })}\n\n`);
       } else {
@@ -245,6 +256,23 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
     });
 
     proc.on('close', code => {
+      if (code !== 0 && !sentAnyChunk && stderrOutput) {
+        let cleanErr = stderrOutput.trim();
+        try {
+          const m = cleanErr.match(/AGY_ERROR:\s*(\{.*\})/);
+          if (m) {
+            const parsed = JSON.parse(m[1]);
+            cleanErr = parsed.short_error || parsed.status || cleanErr;
+          }
+        } catch (_) {}
+        const errorMsg = `\n⚠️ [agent-proxy]: ${cleanErr}\n`;
+        if (apiFormat === 'anthropic') {
+          res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: errorMsg } })}\n\n`);
+        } else {
+          res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: errorMsg }, finish_reason: null }] })}\n\n`);
+        }
+      }
+
       if (apiFormat === 'anthropic') {
         res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
         res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } })}\n\n`);
@@ -267,6 +295,9 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
     let output = '';
     proc.stdout.on('data', chunk => { output += chunk.toString(); });
     proc.on('close', code => {
+      if (code !== 0 && !output && stderrOutput) {
+        output = `⚠️ [agent-proxy]: ${stderrOutput.trim()}`;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       if (apiFormat === 'anthropic') {
         res.end(JSON.stringify({
@@ -297,10 +328,6 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
       log(`✅ [Antigravity] Resposta enviada com sucesso (código ${code})`);
     });
   }
-
-  proc.stderr.on('data', errData => {
-    log(`⚠️  [agy stderr]: ${errData.toString().trim()}`);
-  });
 }
 
 function handleRemoteProviderChat(routeInfo, payload, res, apiFormat) {

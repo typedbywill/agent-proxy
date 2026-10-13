@@ -13,6 +13,8 @@
     "down": "bin/agent-proxy down",
     "restart": "bin/agent-proxy restart",
     "status": "bin/agent-proxy status",
+    "models": "bin/agent-proxy models",
+    "doctor": "bin/agent-proxy doctor",
     "logs": "bin/agent-proxy logs"
   },
   "keywords": [

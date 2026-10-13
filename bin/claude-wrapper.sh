@@ -5,6 +5,9 @@
 
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
 export ANTHROPIC_API_KEY="sk-antigravity"
+export ANTHROPIC_MODEL="ai-proxy"
+export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1
+unset ANTHROPIC_AUTH_TOKEN
 
 # Se o proxy não estiver rodando, sobe imediatamente
 if ! curl -s http://127.0.0.1:8080/health >/dev/null 2>&1; then

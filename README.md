@@ -28,11 +28,19 @@
 ```text
 agent-proxy/
 ├── bin/
-│   └── agent-proxy         # CLI de gerenciamento (up, down, restart, use, logs, status)
+│   ├── agent-proxy         # CLI executável (wrapper rápido que despacha para src/cli/)
+│   └── claude-wrapper.sh   # Wrapper integrado para o Claude Code
 ├── src/
-│   └── server.js           # Servidor HTTP proxy OpenAI & Anthropic
+│   ├── server.js           # Servidor HTTP proxy OpenAI & Anthropic
+│   └── cli/                # CLI modular nativa (zero dependências externas)
+│       ├── index.js        # Parser de comandos e dispatch
+│       ├── formatting.js   # Tabelas, cards ANSI e símbolos visuais
+│       ├── interactive.js  # Seletor interativo via teclado (setas/números)
+│       ├── config-manager.js # Leitura, validação e gravação atômica de providers.json
+│       ├── systemd.js      # Integração com systemctl e health checks
+│       └── commands/       # Subcomandos (status, use, list, doctor, key, logs)
 ├── completions/
-│   └── agent-proxy.fish    # Autocompletes para Fish Shell
+│   └── agent-proxy.fish    # Autocompletes inteligentes e dinâmicos para Fish Shell
 ├── systemd/
 │   └── agent-proxy.service # Serviço systemd do usuário
 ├── nix/
@@ -43,18 +51,20 @@ agent-proxy/
 
 ---
 
-## ⚡ Comandos Rápidos
+## ⚡ Comandos da CLI
 
 | Comando | Descrição |
 | :--- | :--- |
-| `agent-proxy status` | Exibe se o serviço está ativo, porta e o modelo ativo do `ai-proxy` |
-| `agent-proxy use <prov> [mod]` | Alterna o modelo/provedor ativo instantaneamente |
-| `agent-proxy up` / `start` | Inicia o serviço em segundo plano |
-| `agent-proxy down` / `stop` | Encerra o serviço |
+| `agent-proxy status` | Exibe card de status, porta, latência do health check e modelo coringa ativo |
+| `agent-proxy use [prov] [mod]` | Alterna o modelo ativo (**menu interativo com setas** se omitir argumentos) |
+| `agent-proxy models` / `list` | Tabela formatada com provedores, status de chaves e modelos cadastrados |
+| `agent-proxy doctor` | Diagnóstico automático de Node, Antigravity (`agy`), systemd, portas e configs |
+| `agent-proxy key <subcomando>` | Gerencia chaves com segurança (`list`, `set`, `get`, `rm`) |
+| `agent-proxy up` / `start` | Inicia o serviço systemd em segundo plano |
+| `agent-proxy down` / `stop` | Encerra o serviço em segundo plano |
 | `agent-proxy restart` | Reinicia o proxy |
-| `agent-proxy logs` | Monitora as requisições e streaming em tempo real |
-| `agent-proxy set-key <prov> <key>` | Configura a API key de um provedor (ex: `openrouter`) |
-| `agent-proxy config` | Abre o arquivo de configuração `providers.json` |
+| `agent-proxy logs [-n 50]` | Monitora requisições em tempo real com realce de sintaxe HTTP e erros |
+| `agent-proxy config` | Abre o arquivo de configuração `providers.json` no editor ($EDITOR) |
 
 ---
 
