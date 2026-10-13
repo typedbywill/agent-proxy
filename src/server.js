@@ -179,7 +179,23 @@ function resolveRoute(requestedModel) {
 
   // Fallback padrão: rota ativa configurada
   const active = config.active || { provider: 'antigravity', model: 'gemini-3.8-flash-medium' };
-  return { type: 'antigravity', model: active.model || 'gemini-3.8-flash-medium' };
+  log(`⚠️  Modelo '${requestedModel}' não catalogado -> Usando fallback da rota ativa [${active.provider}] '${active.model}'`);
+
+  if (active.provider === 'antigravity') {
+    return { type: 'antigravity', model: active.model || 'gemini-3.8-flash-medium' };
+  }
+
+  const providerObj = config.providers?.[active.provider];
+  if (providerObj) {
+    return {
+      type: 'remote',
+      providerKey: active.provider,
+      provider: providerObj,
+      model: active.model
+    };
+  }
+
+  return { type: 'antigravity', model: 'gemini-3.8-flash-medium' };
 }
 
 function formatMessagesToPrompt(messages) {
