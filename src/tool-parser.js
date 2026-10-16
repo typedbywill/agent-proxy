@@ -123,6 +123,76 @@ function generateToolId() {
 }
 
 /**
+ * Tenta fazer o parse de JSON de forma resiliente, corrigindo problemas comuns
+ * produzidos por LLMs (caracteres de controle não escapados, escapes inválidos, vírgulas residuais, fences markdown).
+ */
+function robustJsonParse(raw) {
+  if (typeof raw !== 'string') return null;
+  let text = raw.trim();
+  if (!text) return null;
+
+  // Limpa blocos de código markdown que alguns modelos inserem dentro das tags
+  if (text.startsWith('```')) {
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  }
+
+  // Tenta parse nativo primeiro (rápido)
+  try {
+    return JSON.parse(text);
+  } catch (_) {}
+
+  // Repara caracteres de controle não escapados e sequências de escape inválidas
+  try {
+    let repaired = '';
+    let inString = false;
+    let escaped = false;
+
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+      if (inString) {
+        if (escaped) {
+          // Checa se o caractere após backslash é um escape JSON padrão: " \ / b f n r t u
+          if (!/[\\"\/bfnrtu]/.test(char)) {
+            // Escape inválido em JSON (ex: \$, \., \ , \', \a). Escapa a barra invertida: \\ + char
+            repaired += '\\\\' + char;
+          } else {
+            repaired += '\\' + char;
+          }
+          escaped = false;
+        } else if (char === '\\') {
+          escaped = true;
+        } else if (char === '"') {
+          inString = false;
+          repaired += '"';
+        } else if (char === '\n') {
+          repaired += '\\n';
+        } else if (char === '\r') {
+          repaired += '\\r';
+        } else if (char === '\t') {
+          repaired += '\\t';
+        } else {
+          repaired += char;
+        }
+      } else {
+        if (char === '"') {
+          inString = true;
+          repaired += '"';
+        } else {
+          repaired += char;
+        }
+      }
+    }
+
+    // Remove vírgulas sobrando antes de } ou ]
+    repaired = repaired.replace(/,(\s*[}\]])/g, '$1');
+
+    return JSON.parse(repaired.trim());
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
  * Validação básica da chamada de ferramenta:
  * - Objeto JSON válido
  * - Nome existente na lista de ferramentas permitidas
@@ -133,13 +203,21 @@ function validateToolCall(callObj, toolsMap) {
   if (!callObj || typeof callObj !== 'object' || Array.isArray(callObj)) {
     return { valid: false, reason: 'Payload must be a JSON object' };
   }
-  const { name, input } = callObj;
+  const name = callObj.name;
   if (!name || typeof name !== 'string') {
     return { valid: false, reason: 'Tool name missing or invalid' };
   }
   if (toolsMap && toolsMap.size > 0 && !toolsMap.has(name)) {
     return { valid: false, reason: `Tool '${name}' not in allowed tools` };
   }
+
+  let input = callObj.input ?? callObj.arguments ?? callObj.parameters ?? {};
+  if (typeof input === 'string') {
+    try {
+      input = robustJsonParse(input) ?? {};
+    } catch (_) {}
+  }
+
   if (input !== undefined && (input === null || typeof input !== 'object' || Array.isArray(input))) {
     return { valid: false, reason: 'Tool input must be an object' };
   }
@@ -195,19 +273,19 @@ function parseNonStreamResponse(text, tools = [], onLog = null) {
     }
 
     const rawJson = text.slice(startIdx + TOOL_CALL_START.length, endIdx);
-    let parsed = null;
-    try {
-      parsed = JSON.parse(rawJson.trim());
-    } catch (_) {}
-
+    const parsed = robustJsonParse(rawJson);
     const val = parsed ? validateToolCall(parsed, toolsMap) : { valid: false, reason: 'Invalid JSON' };
 
     if (val.valid) {
+      let input = parsed.input ?? parsed.arguments ?? parsed.parameters ?? {};
+      if (typeof input === 'string') {
+        try { input = robustJsonParse(input) ?? {}; } catch (_) {}
+      }
       segments.push({
         type: 'tool_use',
         id: parsed.id || generateToolId(),
         name: parsed.name,
-        input: parsed.input || {}
+        input
       });
     } else {
       if (typeof onLog === 'function') {
@@ -326,18 +404,18 @@ function createStreamingToolParser({ tools = [], onText, onToolCall, onStop, onL
           // Limpa artefatos sintáticos comuns (como !] ou !]?>) que ocorrem imediatamente após fechamento
           remaining = remaining.replace(/^!\](?:\?>)?/g, '');
 
-          let parsed = null;
-          try {
-            parsed = JSON.parse(rawJson.trim());
-          } catch (_) {}
-
+          const parsed = robustJsonParse(rawJson);
           const val = parsed ? validateToolCall(parsed, toolsMap) : { valid: false, reason: 'Invalid JSON' };
 
           if (val.valid) {
+            let input = parsed.input ?? parsed.arguments ?? parsed.parameters ?? {};
+            if (typeof input === 'string') {
+              try { input = robustJsonParse(input) ?? {}; } catch (_) {}
+            }
             const call = {
               id: parsed.id || generateToolId(),
               name: parsed.name,
-              input: parsed.input || {}
+              input
             };
             toolCalls.push(call);
             justFinishedTool = true;
@@ -367,10 +445,26 @@ function createStreamingToolParser({ tools = [], onText, onToolCall, onStop, onL
     flush() {
       if (stopped) return;
       if (state === 'INSIDE_TOOL') {
-        const unclosedText = `${TOOL_CALL_START}${buffer}`;
+        const parsed = robustJsonParse(buffer);
+        const val = parsed ? validateToolCall(parsed, toolsMap) : { valid: false };
+        if (val.valid) {
+          let input = parsed.input ?? parsed.arguments ?? parsed.parameters ?? {};
+          if (typeof input === 'string') {
+            try { input = robustJsonParse(input) ?? {}; } catch (_) {}
+          }
+          const call = {
+            id: parsed.id || generateToolId(),
+            name: parsed.name,
+            input
+          };
+          toolCalls.push(call);
+          if (typeof onToolCall === 'function') onToolCall(call);
+        } else {
+          const unclosedText = `${TOOL_CALL_START}${buffer}`;
+          if (typeof onText === 'function') onText(unclosedText);
+        }
         buffer = '';
         state = 'TEXT';
-        if (typeof onText === 'function') onText(unclosedText);
       } else if (state === 'TEXT' && buffer.length > 0) {
         const stopMatch = findFirstStopSequence(buffer, STOP_SEQUENCES);
         const safeText = stopMatch ? buffer.slice(0, stopMatch.index) : buffer;
@@ -400,6 +494,7 @@ module.exports = {
   normalizeTools,
   renderToolsPrompt,
   generateToolId,
+  robustJsonParse,
   validateToolCall,
   parseNonStreamResponse,
   createStreamingToolParser

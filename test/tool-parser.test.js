@@ -7,6 +7,8 @@ const {
   TOOL_CALL_END,
   normalizeTools,
   renderToolsPrompt,
+  generateToolId,
+  robustJsonParse,
   validateToolCall,
   parseNonStreamResponse,
   createStreamingToolParser
@@ -371,6 +373,73 @@ test('parseNonStreamResponse - Trunca em sequências de parada e limpa !]', () =
   assert.equal(res.toolCalls.length, 1);
   assert.equal(res.toolCalls[0].name, 'Read');
   assert.ok(res.segments.every(s => !s.text || (!s.text.includes('User:') && !s.text.includes('Fake'))));
+});
+
+test('robustJsonParse - Suporta escapes inválidos, tabs literais e quebras de linha em strings', () => {
+  // Teste do comando real que falhou no log com \$ e raw tab
+  const rawWithEscapes = `{"id":"toolu_check_docker_socks","name":"Bash","input":{"command":"sshx exec 65 \\"docker ps --filter publish=1080 --format 'table {{.Names}}\\t{{.Image}}'; docker inspect \\$(docker ps -q) 2>/dev/null || true\\""}}`;
+  const parsed = robustJsonParse(rawWithEscapes);
+  assert.ok(parsed);
+  assert.equal(parsed.name, 'Bash');
+  assert.ok(parsed.input.command.includes('docker inspect'));
+
+  // Teste com quebra de linha real (código multiline) dentro da string JSON
+  const multiline = `{"name":"Bash","input":{"command":"python3 -c \\"\nimport os\nprint('hello')\n\\""}}`;
+  const parsedMulti = robustJsonParse(multiline);
+  assert.ok(parsedMulti);
+  assert.equal(parsedMulti.name, 'Bash');
+  assert.ok(parsedMulti.input.command.includes('import os'));
+
+  // Teste com vírgula residual (trailing comma)
+  const trailingComma = `{"name":"Read","input":{"file_path":"test.txt",},}`;
+  const parsedTrailing = robustJsonParse(trailingComma);
+  assert.ok(parsedTrailing);
+  assert.equal(parsedTrailing.name, 'Read');
+  assert.equal(parsedTrailing.input.file_path, 'test.txt');
+
+  // Teste com markdown fence ```json ... ```
+  const markdownFence = '```json\n{"name":"Read","input":{"file_path":"a.txt"}}\n```';
+  const parsedMd = robustJsonParse(markdownFence);
+  assert.ok(parsedMd);
+  assert.equal(parsedMd.input.file_path, 'a.txt');
+});
+
+test('createStreamingToolParser - Suporta comandos com caracteres de controle e escapes inválidos', () => {
+  const toolsReceived = [];
+  const bashTools = [
+    {
+      name: 'Bash',
+      description: 'Run bash command',
+      input_schema: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command']
+      }
+    }
+  ];
+
+  const parser = createStreamingToolParser({
+    tools: bashTools,
+    onToolCall: tc => toolsReceived.push(tc)
+  });
+
+  const rawChunk = `<<TOOL_CALL>>{"id":"toolu_123","name":"Bash","input":{"command":"sshx exec 65 \\"docker ps --format 'table {{.Names}}\\t{{.Ports}}'; inspect \\$(cat id) \\""}}<<END_TOOL_CALL>>`;
+  parser.feed(rawChunk);
+  parser.flush();
+
+  assert.equal(toolsReceived.length, 1);
+  assert.equal(toolsReceived[0].name, 'Bash');
+  assert.ok(toolsReceived[0].input.command.includes('inspect'));
+});
+
+test('validateToolCall e parseNonStreamResponse normalizam arguments/parameters para input', () => {
+  const openAIStyle = `<<TOOL_CALL>>{"name":"Read","arguments":{"file_path":"config.json"}}<<END_TOOL_CALL>>`;
+  const res = parseNonStreamResponse(openAIStyle, sampleTools);
+
+  assert.equal(res.hasToolCalls, true);
+  assert.equal(res.toolCalls.length, 1);
+  assert.equal(res.toolCalls[0].name, 'Read');
+  assert.equal(res.toolCalls[0].input.file_path, 'config.json');
 });
 
 
