@@ -236,6 +236,20 @@ function resolveRoute(requestedModel) {
   return { type: 'antigravity', model: 'gemini-3.8-flash-medium' };
 }
 
+function sanitizeAssistantText(text) {
+  if (typeof text !== 'string') return '';
+  // Remove delimitações simuladas de turnos futuros (ex: "--- \n User:")
+  const stopIndex = text.search(/\n+---+\n+(?:User|Human):/i);
+  if (stopIndex !== -1) {
+    text = text.slice(0, stopIndex);
+  }
+  // Remove blocos de tool result alucinados
+  text = text.replace(/\[Tool Result \([^)]+\):[\s\S]*?\]/g, '');
+  // Remove resíduos de fechamento como !] ou !]?> no final
+  text = text.replace(/!\](?:\?>)?\s*$/g, '');
+  return text.trim();
+}
+
 function formatMessagesToPrompt(payloadOrMessages) {
   let messages = [];
   let systemText = '';
@@ -285,7 +299,7 @@ function formatMessagesToPrompt(payloadOrMessages) {
         } catch (_) {
           inputObj = { raw: tc.function?.arguments || '' };
         }
-        extraParts.push(`${TOOL_CALL_START}${JSON.stringify({ name: tc.function?.name || '', input: inputObj })}${TOOL_CALL_END}`);
+        extraParts.push(`${TOOL_CALL_START}${JSON.stringify({ id: tc.id, name: tc.function?.name || '', input: inputObj })}${TOOL_CALL_END}`);
       }
     }
 
@@ -299,10 +313,13 @@ function formatMessagesToPrompt(payloadOrMessages) {
     if (Array.isArray(content)) {
       content = content
         .map(c => {
-          if (typeof c === 'string') return c;
-          if (c.type === 'text') return c.text || '';
+          if (typeof c === 'string') return m.role === 'assistant' ? sanitizeAssistantText(c) : c;
+          if (c.type === 'text') {
+            const raw = c.text || '';
+            return m.role === 'assistant' ? sanitizeAssistantText(raw) : raw;
+          }
           if (c.type === 'tool_use') {
-            return `${TOOL_CALL_START}${JSON.stringify({ name: c.name, input: c.input || {} })}${TOOL_CALL_END}`;
+            return `${TOOL_CALL_START}${JSON.stringify({ id: c.id, name: c.name, input: c.input || {} })}${TOOL_CALL_END}`;
           }
           if (c.type === 'tool_result') {
             let resText = c.content;
@@ -316,6 +333,8 @@ function formatMessagesToPrompt(payloadOrMessages) {
           return c.text || c.content || JSON.stringify(c);
         })
         .join('\n');
+    } else if (typeof content === 'string') {
+      content = m.role === 'assistant' ? sanitizeAssistantText(content) : content;
     } else if (typeof content !== 'string') {
       content = JSON.stringify(content || '');
     }
@@ -495,6 +514,10 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
         };
         res.write(`data: ${JSON.stringify(tcChunk)}\n\n`);
       }
+    },
+    onStop: reason => {
+      log(`🛑 [Antigravity] Encerramento solicitado pelo parser (${reason})`);
+      finishAntigravityResponse(0);
     },
     onLog: log
   });

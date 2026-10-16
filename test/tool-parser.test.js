@@ -314,3 +314,63 @@ test('OpenAI format mapping - Streaming chunks de tool_calls', () => {
   assert.equal(parser.hasToolCalls(), true);
 });
 
+test('createStreamingToolParser - Detecção de Stop Sequence interrompe alucinação de turnos do usuário', () => {
+  const textChunks = [];
+  const tools = [];
+  let stopReason = null;
+
+  const parser = createStreamingToolParser({
+    tools: sampleTools,
+    onText: t => textChunks.push(t),
+    onToolCall: tc => tools.push(tc),
+    onStop: reason => {
+      stopReason = reason;
+    }
+  });
+
+  // Simula o Gemini chamando Read e tentando alucinar o turno User com tool result falso
+  parser.feed('Vou ler agora.\n<<TOOL_CALL>>{"name":"Read","input":{"file_path":"config.json"}}<<END_TOOL_CALL>>');
+  parser.feed('!]?>\n\n---\n\nUser:\n[Tool Result (toolu_123): arquivo nao encontrado]');
+  parser.flush();
+
+  assert.equal(tools.length, 1);
+  assert.equal(tools[0].name, 'Read');
+  assert.deepEqual(tools[0].input, { file_path: 'config.json' });
+
+  // O texto emitido antes da tool call é preservado, mas a alucinação de "User:" é cortada
+  const fullText = textChunks.join('');
+  assert.ok(fullText.includes('Vou ler agora.'));
+  assert.ok(!fullText.includes('User:'));
+  assert.ok(!fullText.includes('[Tool Result'));
+  assert.ok(!fullText.includes('!]?>'));
+  assert.equal(stopReason, 'stop_sequence');
+});
+
+test('createStreamingToolParser - Limpeza de artefatos de fechamento !] e !]?> após tool_use', () => {
+  const textChunks = [];
+  const tools = [];
+
+  const parser = createStreamingToolParser({
+    tools: sampleTools,
+    onText: t => textChunks.push(t),
+    onToolCall: tc => tools.push(tc)
+  });
+
+  parser.feed('<<TOOL_CALL>>{"name":"Read","input":{"file_path":"test.json"}}<<END_TOOL_CALL>>!]');
+  parser.flush();
+
+  assert.equal(tools.length, 1);
+  assert.equal(textChunks.join(''), '');
+});
+
+test('parseNonStreamResponse - Trunca em sequências de parada e limpa !]', () => {
+  const raw = 'Texto legítimo\n<<TOOL_CALL>>{"name":"Read","input":{"file_path":"x"}}<<END_TOOL_CALL>>!]\n\n---\n\nUser:\nFake';
+  const res = parseNonStreamResponse(raw, sampleTools);
+
+  assert.equal(res.hasToolCalls, true);
+  assert.equal(res.toolCalls.length, 1);
+  assert.equal(res.toolCalls[0].name, 'Read');
+  assert.ok(res.segments.every(s => !s.text || (!s.text.includes('User:') && !s.text.includes('Fake'))));
+});
+
+
