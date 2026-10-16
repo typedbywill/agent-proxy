@@ -19,6 +19,13 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const {
+  TOOL_CALL_START,
+  TOOL_CALL_END,
+  renderToolsPrompt,
+  parseNonStreamResponse,
+  createStreamingToolParser
+} = require('./tool-parser');
 
 const PORT = parseInt(process.env.AGENT_PROXY_PORT || '8080', 10);
 const HOST = process.env.AGENT_PROXY_HOST || '127.0.0.1';
@@ -201,6 +208,7 @@ function resolveRoute(requestedModel) {
 function formatMessagesToPrompt(payloadOrMessages) {
   let messages = [];
   let systemText = '';
+  let tools = [];
 
   if (Array.isArray(payloadOrMessages)) {
     messages = payloadOrMessages;
@@ -213,9 +221,21 @@ function formatMessagesToPrompt(payloadOrMessages) {
           ? payloadOrMessages.system.map(s => (typeof s === 'string' ? s : s.text || s.content || '')).join('\n')
           : '';
     }
+    if (Array.isArray(payloadOrMessages.tools) && payloadOrMessages.tools.length > 0) {
+      tools = payloadOrMessages.tools;
+    }
   }
 
   const parts = [];
+
+  // Se houver catálogo de ferramentas, renderiza as instruções correspondentes
+  if (tools.length > 0) {
+    const toolsPrompt = renderToolsPrompt(tools);
+    if (toolsPrompt) {
+      systemText = systemText ? `${systemText}\n\n${toolsPrompt}` : toolsPrompt;
+    }
+  }
+
   if (systemText && systemText.trim()) {
     parts.push(`System Instructions:\n${systemText.trim()}`);
   }
@@ -223,12 +243,36 @@ function formatMessagesToPrompt(payloadOrMessages) {
   for (const m of messages) {
     const role = m.role === 'assistant' ? 'Model' : m.role === 'system' ? 'System Instructions' : 'User';
     let content = m.content;
+    const extraParts = [];
+
+    // Suporte a tool_calls formato OpenAI em mensagens de assistente
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      for (const tc of m.tool_calls) {
+        let inputObj = {};
+        try {
+          inputObj = typeof tc.function?.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function?.arguments || {};
+        } catch (_) {
+          inputObj = { raw: tc.function?.arguments || '' };
+        }
+        extraParts.push(`${TOOL_CALL_START}${JSON.stringify({ name: tc.function?.name || '', input: inputObj })}${TOOL_CALL_END}`);
+      }
+    }
+
+    // Suporte a respostas de ferramentas formato OpenAI (role: 'tool')
+    if (m.role === 'tool') {
+      const toolResText = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
+      parts.push(`User:\n[Tool Result (${m.tool_call_id || ''}): ${toolResText}]`);
+      continue;
+    }
+
     if (Array.isArray(content)) {
       content = content
         .map(c => {
           if (typeof c === 'string') return c;
           if (c.type === 'text') return c.text || '';
-          if (c.type === 'tool_use') return `[Tool Use: ${c.name} with input ${JSON.stringify(c.input || {})}]`;
+          if (c.type === 'tool_use') {
+            return `${TOOL_CALL_START}${JSON.stringify({ name: c.name, input: c.input || {} })}${TOOL_CALL_END}`;
+          }
           if (c.type === 'tool_result') {
             let resText = c.content;
             if (Array.isArray(resText)) {
@@ -244,7 +288,13 @@ function formatMessagesToPrompt(payloadOrMessages) {
     } else if (typeof content !== 'string') {
       content = JSON.stringify(content || '');
     }
-    parts.push(`${role}:\n${content || ''}`);
+
+    let fullMessageContent = (content || '').trim();
+    if (extraParts.length > 0) {
+      fullMessageContent = fullMessageContent ? `${fullMessageContent}\n${extraParts.join('\n')}` : extraParts.join('\n');
+    }
+
+    parts.push(`${role}:\n${fullMessageContent}`);
   }
 
   if (parts.length === 0) return '';
@@ -472,15 +522,46 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
       if (code !== 0 && !output && (resultError || stderrOutput)) {
         output = `⚠️ [agent-proxy]: ${(resultError || stderrOutput).trim()}`;
       }
+
+      let parsedTools = null;
+      if (payload.tools && Array.isArray(payload.tools) && payload.tools.length > 0) {
+        parsedTools = parseNonStreamResponse(output, payload.tools, log);
+      }
+
       res.writeHead(200, { 'Content-Type': 'application/json' });
       if (apiFormat === 'anthropic') {
+        let contentBlocks = [];
+        let stopReason = 'end_turn';
+
+        if (parsedTools && parsedTools.segments.length > 0) {
+          contentBlocks = parsedTools.segments.map(seg => {
+            if (seg.type === 'tool_use') {
+              return {
+                type: 'tool_use',
+                id: seg.id,
+                name: seg.name,
+                input: seg.input
+              };
+            }
+            return {
+              type: 'text',
+              text: seg.text
+            };
+          });
+          if (parsedTools.hasToolCalls) {
+            stopReason = 'tool_use';
+          }
+        } else {
+          contentBlocks = [{ type: 'text', text: output.trim() }];
+        }
+
         res.end(JSON.stringify({
           id: msgId,
           type: 'message',
           role: 'assistant',
           model,
-          content: [{ type: 'text', text: output.trim() }],
-          stop_reason: 'end_turn',
+          content: contentBlocks,
+          stop_reason: stopReason,
           usage: {
             input_tokens: usageData.input_tokens || 0,
             output_tokens: usageData.output_tokens || 0

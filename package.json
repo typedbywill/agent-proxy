@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "node src/server.js",
+    "test": "node --test test/*.test.js",
     "up": "bin/agent-proxy up",
     "down": "bin/agent-proxy down",
     "restart": "bin/agent-proxy restart",
