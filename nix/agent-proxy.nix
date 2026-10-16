@@ -1,14 +1,13 @@
 { config, pkgs, lib, ... }:
 
 let
-  proxyServer = pkgs.writeScriptBin "agent-proxy-server" ''
-    #!${pkgs.nodejs}/bin/node
-    ${builtins.readFile ./agent-proxy-server.js}
+  src = ../.;
+  proxyServer = pkgs.writeShellScriptBin "agent-proxy-server" ''
+    exec ${pkgs.nodejs}/bin/node ${src}/src/server.js "$@"
   '';
 
-  proxyCli = pkgs.writeScriptBin "agent-proxy" ''
-    #!${pkgs.bash}/bin/bash
-    ${builtins.readFile ../scripts/agent-proxy.sh}
+  proxyCli = pkgs.writeShellScriptBin "agent-proxy" ''
+    exec ${pkgs.nodejs}/bin/node ${src}/src/cli/index.js "$@"
   '';
 in
 {
