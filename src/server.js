@@ -273,6 +273,15 @@ function formatMessagesToPrompt(payloadOrMessages) {
 
   const parts = [];
 
+  const PROXY_ENVIRONMENT_HEADER = [
+    'CRITICAL PROXY ENVIRONMENT INSTRUCTION:',
+    'You are operating strictly as a remote LLM completion engine behind an API proxy.',
+    'You DO NOT have an execution environment, filesystem access, or bash terminal directly.',
+    'You MUST NEVER execute any internal agent tools (such as run_command, view_file, grep_search, replace_file_content, etc.). Any attempt to execute internal tools is strictly forbidden.',
+    'If tools are needed, you must ONLY output the tool call text wrapped in the specified <<TOOL_CALL>> markers.',
+    'Otherwise, respond directly in text.'
+  ].join('\n');
+
   // Se houver catálogo de ferramentas, renderiza as instruções correspondentes
   if (tools.length > 0) {
     const toolsPrompt = renderToolsPrompt(tools);
@@ -281,8 +290,13 @@ function formatMessagesToPrompt(payloadOrMessages) {
     }
   }
 
-  if (systemText && systemText.trim()) {
-    parts.push(`System Instructions:\n${systemText.trim()}`);
+  const fullSystemText = [
+    PROXY_ENVIRONMENT_HEADER,
+    systemText
+  ].filter(Boolean).join('\n\n');
+
+  if (fullSystemText.trim()) {
+    parts.push(`System Instructions:\n${fullSystemText.trim()}`);
   }
 
   for (const m of messages) {
@@ -348,10 +362,17 @@ function formatMessagesToPrompt(payloadOrMessages) {
   }
 
   if (parts.length === 0) return '';
-  if (parts.length === 1 && !systemText && messages.length === 1 && messages[0].role === 'user') {
-    const firstContent = messages[0].content;
-    if (typeof firstContent === 'string') return firstContent;
-  }
+
+  const PROXY_REMINDER = [
+    'System Reminder:',
+    'CRITICAL: You are an API backend completion engine. You DO NOT have execution capabilities or a terminal directly.',
+    'DO NOT CALL internal Antigravity tools (run_command, view_file, replace_file_content, etc.). Internal tool execution is strictly prohibited.',
+    tools.length > 0
+      ? 'If you need to execute tools, you MUST emit them wrapped in <<TOOL_CALL>>{"name":"...","input":{...}}<<END_TOOL_CALL>>.'
+      : 'Respond directly in text.'
+  ].join('\n');
+
+  parts.push(PROXY_REMINDER);
 
   return parts.join('\n\n---\n\n') + '\n\nModel:\n';
 }
@@ -373,7 +394,7 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
     '--output-format=stream-json'
   ];
 
-  const proc = spawn(AGY_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+  const proc = spawn(AGY_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'], detached: true });
 
   const inputPayload = JSON.stringify({
     event: 'user',
@@ -721,9 +742,13 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
 
   function killProcess() {
     if (proc && proc.pid) {
-      try { process.kill(proc.pid, 'SIGTERM'); } catch (_) {}
+      try { process.kill(-proc.pid, 'SIGTERM'); } catch (_) {
+        try { process.kill(proc.pid, 'SIGTERM'); } catch (_) {}
+      }
       setTimeout(() => {
-        try { process.kill(proc.pid, 'SIGKILL'); } catch (_) {}
+        try { process.kill(-proc.pid, 'SIGKILL'); } catch (_) {
+          try { process.kill(proc.pid, 'SIGKILL'); } catch (_) {}
+        }
       }, 800);
     }
   }
