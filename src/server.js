@@ -36,6 +36,9 @@ const CONFIG_FILE = process.env.AGENT_PROXY_CONFIG || path.join(os.homedir(), '.
 const ALIAS_MODEL_NAMES = ['ai-proxy', 'agent-proxy', 'default', 'custom', 'auto'];
 
 const DEFAULT_ANTIGRAVITY_MODELS = [
+  'gemini-4-argon-high',
+  'gemini-4-argon-medium',
+  'gemini-4-argon-low',
   'gemini-3.8-flash-high',
   'gemini-3.8-flash-medium',
   'gemini-3.8-flash-low',
@@ -157,6 +160,34 @@ function resolveRoute(requestedModel) {
   const agyModels = (config.providers?.antigravity?.models) || DEFAULT_ANTIGRAVITY_MODELS;
   if (agyModels.includes(requestedModel)) {
     return { type: 'antigravity', model: requestedModel };
+  }
+
+  // 2.1 Aliases amigáveis para modelos Gemini no Antigravity
+  if (reqLower === 'gemini' || reqLower === 'gemini-flash' || reqLower === 'gemini-3.8-flash' || reqLower === 'flash') {
+    return { type: 'antigravity', model: 'gemini-3.8-flash-medium' };
+  }
+  if (reqLower === 'gemini-flash-high' || reqLower === 'gemini-high' || reqLower === 'flash-high') {
+    return { type: 'antigravity', model: 'gemini-3.8-flash-high' };
+  }
+  if (reqLower === 'gemini-flash-low' || reqLower === 'gemini-low' || reqLower === 'flash-low') {
+    return { type: 'antigravity', model: 'gemini-3.8-flash-low' };
+  }
+  if (reqLower === 'gemini-argon' || reqLower === 'gemini-4-argon' || reqLower === 'argon') {
+    return { type: 'antigravity', model: 'gemini-4-argon-medium' };
+  }
+  if (reqLower === 'gemini-argon-high' || reqLower === 'argon-high') {
+    return { type: 'antigravity', model: 'gemini-4-argon-high' };
+  }
+  if (reqLower === 'gemini-argon-low' || reqLower === 'argon-low') {
+    return { type: 'antigravity', model: 'gemini-4-argon-low' };
+  }
+
+  // 2.2 Busca aproximada para modelos gemini
+  if (reqLower.startsWith('gemini') || reqLower.startsWith('argon')) {
+    const matched = agyModels.find(m => m.toLowerCase().includes(reqLower) || reqLower.includes(m.toLowerCase()));
+    if (matched) {
+      return { type: 'antigravity', model: matched };
+    }
   }
 
   // 3. Se for de algum provedor cadastrado
