@@ -363,6 +363,111 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
     log(`⚠️  [agy stderr]: ${text.trim()}`);
   });
 
+  let currentBlockIndex = 0;
+  let textBlockStarted = false;
+  let textBlockClosed = false;
+  let isCompleted = false;
+  let toolCallIndex = 0;
+
+  const streamingParser = createStreamingToolParser({
+    tools: payload.tools || [],
+    onText: textChunk => {
+      sentAnyChunk = true;
+      if (apiFormat === 'anthropic') {
+        if (!textBlockStarted || textBlockClosed) {
+          res.write(`event: content_block_start\ndata: ${JSON.stringify({
+            type: 'content_block_start',
+            index: currentBlockIndex,
+            content_block: { type: 'text', text: '' }
+          })}\n\n`);
+          textBlockStarted = true;
+          textBlockClosed = false;
+        }
+        res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+          type: 'content_block_delta',
+          index: currentBlockIndex,
+          delta: { type: 'text_delta', text: textChunk }
+        })}\n\n`);
+      } else {
+        const sseData = {
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: { content: textChunk }, finish_reason: null }]
+        };
+        res.write(`data: ${JSON.stringify(sseData)}\n\n`);
+      }
+    },
+    onToolCall: call => {
+      sentAnyChunk = true;
+      if (apiFormat === 'anthropic') {
+        if (textBlockStarted && !textBlockClosed) {
+          res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+            type: 'content_block_stop',
+            index: currentBlockIndex
+          })}\n\n`);
+          textBlockClosed = true;
+          currentBlockIndex++;
+        }
+
+        const toolBlockIdx = currentBlockIndex++;
+        res.write(`event: content_block_start\ndata: ${JSON.stringify({
+          type: 'content_block_start',
+          index: toolBlockIdx,
+          content_block: {
+            type: 'tool_use',
+            id: call.id,
+            name: call.name,
+            input: {}
+          }
+        })}\n\n`);
+
+        res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+          type: 'content_block_delta',
+          index: toolBlockIdx,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: JSON.stringify(call.input || {})
+          }
+        })}\n\n`);
+
+        res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+          type: 'content_block_stop',
+          index: toolBlockIdx
+        })}\n\n`);
+      } else {
+        const tcChunk = {
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: toolCallIndex++,
+                    id: call.id,
+                    type: 'function',
+                    function: {
+                      name: call.name,
+                      arguments: JSON.stringify(call.input || {})
+                    }
+                  }
+                ]
+              },
+              finish_reason: null
+            }
+          ]
+        };
+        res.write(`data: ${JSON.stringify(tcChunk)}\n\n`);
+      }
+    },
+    onLog: log
+  });
+
   if (isStream) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -372,7 +477,6 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
 
     if (apiFormat === 'anthropic') {
       res.write(`event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', model, content: [], usage: { input_tokens: 0, output_tokens: 0 } } })}\n\n`);
-      res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`);
     } else {
       const initialChunk = {
         id: completionId,
@@ -398,87 +502,20 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
     }, 5000);
   }
 
-  res.on('close', () => {
-    if (pingInterval) clearInterval(pingInterval);
-    if (!proc.killed) {
-      try { proc.kill('SIGTERM'); } catch (_) {}
-    }
-  });
+  function finishAntigravityResponse(exitCode = 0) {
+    if (isCompleted) return;
+    isCompleted = true;
 
-  function processStdoutLine(line) {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    let parsed;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch (_) {
-      return;
-    }
-
-    if (parsed.event === 'step_update' && parsed.step_update) {
-      const step = parsed.step_update;
-      if (step.step_type === 'agent_response' && step.text_delta) {
-        const text = step.text_delta;
-        sentAnyChunk = true;
-        accumulatedText += text;
-
-        if (isStream) {
-          if (apiFormat === 'anthropic') {
-            res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })}\n\n`);
-          } else {
-            const sseData = {
-              id: completionId,
-              object: 'chat.completion.chunk',
-              created,
-              model,
-              choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
-            };
-            res.write(`data: ${JSON.stringify(sseData)}\n\n`);
-          }
-        }
-      }
-      if (step.usage) {
-        usageData = {
-          input_tokens: step.usage.input_tokens ?? usageData.input_tokens,
-          output_tokens: step.usage.output_tokens ?? usageData.output_tokens,
-          total_tokens: step.usage.total_tokens ?? usageData.total_tokens
-        };
-      }
-    } else if (parsed.event === 'result' && parsed.result) {
-      if (parsed.result.response) {
-        finalResponse = parsed.result.response;
-      }
-      if (parsed.result.usage) {
-        usageData = {
-          input_tokens: parsed.result.usage.input_tokens ?? usageData.input_tokens,
-          output_tokens: parsed.result.usage.output_tokens ?? usageData.output_tokens,
-          total_tokens: parsed.result.usage.total_tokens ?? usageData.total_tokens
-        };
-      }
-      if (parsed.result.status === 'ERROR' && parsed.result.error) {
-        resultError = parsed.result.error;
-      }
-    }
-  }
-
-  proc.stdout.on('data', chunk => {
-    stdoutBuffer += chunk.toString();
-    const lines = stdoutBuffer.split('\n');
-    stdoutBuffer = lines.pop();
-    for (const l of lines) {
-      processStdoutLine(l);
-    }
-  });
-
-  proc.on('close', code => {
-    if (pingInterval) clearInterval(pingInterval);
-    if (stdoutBuffer.trim()) {
-      processStdoutLine(stdoutBuffer);
-      stdoutBuffer = '';
+    if (pingInterval) {
+      clearInterval(pingInterval);
+      pingInterval = null;
     }
 
     if (isStream) {
-      if (code !== 0 && !sentAnyChunk && (resultError || stderrOutput)) {
+      streamingParser.flush();
+      const hasTools = streamingParser.hasToolCalls();
+
+      if (exitCode !== 0 && !sentAnyChunk && (resultError || stderrOutput)) {
         let cleanErr = (resultError || stderrOutput).trim();
         try {
           const m = cleanErr.match(/AGY_ERROR:\s*(\{.*\})/);
@@ -489,15 +526,29 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
         } catch (_) {}
         const errorMsg = `\n⚠️ [agent-proxy]: ${cleanErr}\n`;
         if (apiFormat === 'anthropic') {
-          res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: errorMsg } })}\n\n`);
+          if (!textBlockStarted || textBlockClosed) {
+            res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: currentBlockIndex, content_block: { type: 'text', text: '' } })}\n\n`);
+            textBlockStarted = true;
+          }
+          res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text: errorMsg } })}\n\n`);
         } else {
           res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: errorMsg }, finish_reason: null }] })}\n\n`);
         }
       }
 
       if (apiFormat === 'anthropic') {
-        res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
-        res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: usageData.output_tokens || 0 } })}\n\n`);
+        if (textBlockStarted && !textBlockClosed) {
+          res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: currentBlockIndex })}\n\n`);
+          textBlockClosed = true;
+        }
+
+        if (!textBlockStarted && !hasTools) {
+          res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`);
+          res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+        }
+
+        const stopReason = hasTools ? 'tool_use' : 'end_turn';
+        res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: stopReason }, usage: { output_tokens: usageData.output_tokens || 0 } })}\n\n`);
         res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
       } else {
         const finalChunk = {
@@ -505,7 +556,7 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
           object: 'chat.completion.chunk',
           created,
           model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          choices: [{ index: 0, delta: {}, finish_reason: hasTools ? 'tool_calls' : 'stop' }],
           usage: {
             prompt_tokens: usageData.input_tokens || 0,
             completion_tokens: usageData.output_tokens || 0,
@@ -516,10 +567,10 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
         res.write('data: [DONE]\n\n');
       }
       res.end();
-      log(`✅ [Antigravity] Finalizado com código ${code}`);
+      log(`✅ [Antigravity] Stream finalizado com sucesso (stop: ${hasTools ? 'tool_use' : 'end_turn'})`);
     } else {
       let output = finalResponse || accumulatedText;
-      if (code !== 0 && !output && (resultError || stderrOutput)) {
+      if (exitCode !== 0 && !output && (resultError || stderrOutput)) {
         output = `⚠️ [agent-proxy]: ${(resultError || stderrOutput).trim()}`;
       }
 
@@ -568,6 +619,27 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
           }
         }));
       } else {
+        let messageObj = { role: 'assistant', content: output.trim() };
+        let finishReason = 'stop';
+
+        if (parsedTools && parsedTools.hasToolCalls) {
+          const textOnly = parsedTools.segments
+            .filter(s => s.type === 'text')
+            .map(s => s.text)
+            .join('')
+            .trim();
+          messageObj.content = textOnly || null;
+          messageObj.tool_calls = parsedTools.toolCalls.map((tc, idx) => ({
+            id: tc.id || `call_${Date.now()}_${idx}`,
+            type: 'function',
+            function: {
+              name: tc.name,
+              arguments: JSON.stringify(tc.input || {})
+            }
+          }));
+          finishReason = 'tool_calls';
+        }
+
         res.end(JSON.stringify({
           id: completionId,
           object: 'chat.completion',
@@ -576,8 +648,8 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
           choices: [
             {
               index: 0,
-              message: { role: 'assistant', content: output.trim() },
-              finish_reason: 'stop'
+              message: messageObj,
+              finish_reason: finishReason
             }
           ],
           usage: {
@@ -587,8 +659,83 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
           }
         }));
       }
-      log(`✅ [Antigravity] Resposta enviada com sucesso (código ${code})`);
+      log(`✅ [Antigravity] Resposta enviada com sucesso (código ${exitCode})`);
     }
+
+    if (!proc.killed) {
+      try { proc.kill('SIGTERM'); } catch (_) {}
+    }
+  }
+
+  res.on('close', () => {
+    if (pingInterval) clearInterval(pingInterval);
+    if (!proc.killed) {
+      try { proc.kill('SIGTERM'); } catch (_) {}
+    }
+  });
+
+  function processStdoutLine(line) {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (_) {
+      return;
+    }
+
+    if (parsed.event === 'step_update' && parsed.step_update) {
+      const step = parsed.step_update;
+      if (step.step_type === 'agent_response' && step.text_delta) {
+        const text = step.text_delta;
+        accumulatedText += text;
+
+        if (isStream) {
+          streamingParser.feed(text);
+        }
+      }
+      if (step.usage) {
+        usageData = {
+          input_tokens: step.usage.input_tokens ?? usageData.input_tokens,
+          output_tokens: step.usage.output_tokens ?? usageData.output_tokens,
+          total_tokens: step.usage.total_tokens ?? usageData.total_tokens
+        };
+      }
+    } else if (parsed.event === 'result' && parsed.result) {
+      if (parsed.result.response) {
+        finalResponse = parsed.result.response;
+      }
+      if (parsed.result.usage) {
+        usageData = {
+          input_tokens: parsed.result.usage.input_tokens ?? usageData.input_tokens,
+          output_tokens: parsed.result.usage.output_tokens ?? usageData.output_tokens,
+          total_tokens: parsed.result.usage.total_tokens ?? usageData.total_tokens
+        };
+      }
+      if (parsed.result.status === 'ERROR' && parsed.result.error) {
+        resultError = parsed.result.error;
+      }
+
+      // Requisito 5: Encerra imediatamente no evento result para evitar travamento aguardando close do processo
+      finishAntigravityResponse(0);
+    }
+  }
+
+  proc.stdout.on('data', chunk => {
+    stdoutBuffer += chunk.toString();
+    const lines = stdoutBuffer.split('\n');
+    stdoutBuffer = lines.pop();
+    for (const l of lines) {
+      processStdoutLine(l);
+    }
+  });
+
+  proc.on('close', code => {
+    if (stdoutBuffer.trim()) {
+      processStdoutLine(stdoutBuffer);
+      stdoutBuffer = '';
+    }
+    finishAntigravityResponse(code);
   });
 }
 
