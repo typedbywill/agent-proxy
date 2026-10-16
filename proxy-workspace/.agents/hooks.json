@@ -1,0 +1,21 @@
+{
+  "proxy-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"decision\":\"deny\",\"reason\":\"All tools blocked in proxy mode\"}'"
+          }
+        ]
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "echo '{\"terminationBehavior\":\"terminate\"}'"
+      }
+    ]
+  }
+}

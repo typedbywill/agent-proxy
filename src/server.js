@@ -32,6 +32,51 @@ const HOST = process.env.AGENT_PROXY_HOST || '127.0.0.1';
 const AGY_BIN = process.env.AGY_BIN || path.join(os.homedir(), '.local/bin/agy');
 const LOG_FILE = process.env.AGENT_PROXY_LOG || path.join(os.homedir(), '.agent-proxy.log');
 const CONFIG_FILE = process.env.AGENT_PROXY_CONFIG || path.join(os.homedir(), '.config/agent-proxy/providers.json');
+const PROXY_WORKSPACE_DIR = process.env.AGENT_PROXY_WORKSPACE || path.resolve(__dirname, '..', 'proxy-workspace');
+
+function ensureProxyWorkspace() {
+  const agentsDir = path.join(PROXY_WORKSPACE_DIR, '.agents');
+  if (!fs.existsSync(agentsDir)) {
+    fs.mkdirSync(agentsDir, { recursive: true });
+  }
+
+  const hooksFile = path.join(agentsDir, 'hooks.json');
+  if (!fs.existsSync(hooksFile)) {
+    const hooksContent = {
+      "proxy-guard": {
+        "PreToolUse": [
+          {
+            "matcher": "*",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "echo '{\"decision\":\"deny\",\"reason\":\"All tools blocked in proxy mode\"}'"
+              }
+            ]
+          }
+        ],
+        "PostInvocation": [
+          {
+            "type": "command",
+            "command": "echo '{\"terminationBehavior\":\"terminate\"}'"
+          }
+        ]
+      }
+    };
+    fs.writeFileSync(hooksFile, JSON.stringify(hooksContent, null, 2), 'utf8');
+  }
+
+  const geminiFile = path.join(PROXY_WORKSPACE_DIR, 'GEMINI.md');
+  if (!fs.existsSync(geminiFile)) {
+    const geminiContent = `# Proxy Mode Rule
+You are operating strictly as a remote LLM text completion engine for an external API proxy.
+You MUST NEVER invoke any internal Antigravity tools (such as run_command, view_file, replace_file_content, etc.).
+Whenever tools are requested by the client, you MUST output them formatted using <<TOOL_CALL>>...<<END_TOOL_CALL>> blocks as instructed in the prompt.
+Otherwise, respond directly in standard text.
+`;
+    fs.writeFileSync(geminiFile, geminiContent, 'utf8');
+  }
+}
 
 const ALIAS_MODEL_NAMES = ['ai-proxy', 'agent-proxy', 'default', 'custom', 'auto'];
 
@@ -394,7 +439,12 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
     '--output-format=stream-json'
   ];
 
-  const proc = spawn(AGY_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+  ensureProxyWorkspace();
+  const proc = spawn(AGY_BIN, args, {
+    cwd: PROXY_WORKSPACE_DIR,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    detached: true
+  });
 
   const inputPayload = JSON.stringify({
     event: 'user',
