@@ -244,3 +244,73 @@ test('createStreamingToolParser - JSON inválido no stream faz fallback para tex
   assert.equal(receivedText.join(''), 'Começo <<TOOL_CALL>>{bad_json}<<END_TOOL_CALL>> fim');
   assert.ok(logged.some(m => m.includes('Chamada inválida')));
 });
+
+test('OpenAI format mapping - Non-stream tool_calls e finish_reason', () => {
+  const raw = 'Explicando ação\n<<TOOL_CALL>>{"name":"Read","input":{"file_path":"openai.json"}}<<END_TOOL_CALL>>';
+  const parsed = parseNonStreamResponse(raw, sampleTools);
+
+  assert.equal(parsed.hasToolCalls, true);
+  const textOnly = parsed.segments.filter(s => s.type === 'text').map(s => s.text).join('').trim();
+  const openAIToolCalls = parsed.toolCalls.map((tc, idx) => ({
+    id: tc.id || `call_${idx}`,
+    type: 'function',
+    function: {
+      name: tc.name,
+      arguments: JSON.stringify(tc.input)
+    }
+  }));
+
+  const choice = {
+    message: {
+      role: 'assistant',
+      content: textOnly || null,
+      tool_calls: openAIToolCalls
+    },
+    finish_reason: parsed.hasToolCalls ? 'tool_calls' : 'stop'
+  };
+
+  assert.equal(choice.message.content, 'Explicando ação');
+  assert.equal(choice.finish_reason, 'tool_calls');
+  assert.equal(choice.message.tool_calls.length, 1);
+  assert.equal(choice.message.tool_calls[0].function.name, 'Read');
+  assert.equal(choice.message.tool_calls[0].function.arguments, '{"file_path":"openai.json"}');
+});
+
+test('OpenAI format mapping - Streaming chunks de tool_calls', () => {
+  const chunks = [];
+  let toolCallIndex = 0;
+
+  const parser = createStreamingToolParser({
+    tools: sampleTools,
+    onText: text => {
+      chunks.push({ delta: { content: text }, finish_reason: null });
+    },
+    onToolCall: call => {
+      chunks.push({
+        delta: {
+          tool_calls: [
+            {
+              index: toolCallIndex++,
+              id: call.id,
+              type: 'function',
+              function: {
+                name: call.name,
+                arguments: JSON.stringify(call.input)
+              }
+            }
+          ]
+        },
+        finish_reason: null
+      });
+    }
+  });
+
+  parser.feed('<<TOOL_CALL>>{"name":"Write","input":{"file_path":"a.txt","content":"b"}}<<END_TOOL_CALL>>');
+  parser.flush();
+
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0].delta.tool_calls[0].function.name, 'Write');
+  assert.equal(chunks[0].delta.tool_calls[0].function.arguments, '{"file_path":"a.txt","content":"b"}');
+  assert.equal(parser.hasToolCalls(), true);
+});
+
