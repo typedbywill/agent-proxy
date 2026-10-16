@@ -198,29 +198,66 @@ function resolveRoute(requestedModel) {
   return { type: 'antigravity', model: 'gemini-3.8-flash-medium' };
 }
 
-function formatMessagesToPrompt(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return '';
-  if (messages.length === 1) {
-    const content = messages[0].content;
-    return typeof content === 'string' ? content : JSON.stringify(content);
+function formatMessagesToPrompt(payloadOrMessages) {
+  let messages = [];
+  let systemText = '';
+
+  if (Array.isArray(payloadOrMessages)) {
+    messages = payloadOrMessages;
+  } else if (payloadOrMessages && typeof payloadOrMessages === 'object') {
+    messages = payloadOrMessages.messages || [];
+    if (payloadOrMessages.system) {
+      systemText = typeof payloadOrMessages.system === 'string'
+        ? payloadOrMessages.system
+        : Array.isArray(payloadOrMessages.system)
+          ? payloadOrMessages.system.map(s => (typeof s === 'string' ? s : s.text || s.content || '')).join('\n')
+          : '';
+    }
   }
 
-  return messages
-    .map(m => {
-      const role = m.role === 'assistant' ? 'Model' : m.role === 'system' ? 'System Instructions' : 'User';
-      let content = m.content;
-      if (Array.isArray(content)) {
-        content = content
-          .map(c => (typeof c === 'string' ? c : c.text || c.content || ''))
-          .join('\n');
-      }
-      return `${role}:\n${content || ''}`;
-    })
-    .join('\n\n---\n\n') + '\n\nModel:\n';
+  const parts = [];
+  if (systemText && systemText.trim()) {
+    parts.push(`System Instructions:\n${systemText.trim()}`);
+  }
+
+  for (const m of messages) {
+    const role = m.role === 'assistant' ? 'Model' : m.role === 'system' ? 'System Instructions' : 'User';
+    let content = m.content;
+    if (Array.isArray(content)) {
+      content = content
+        .map(c => {
+          if (typeof c === 'string') return c;
+          if (c.type === 'text') return c.text || '';
+          if (c.type === 'tool_use') return `[Tool Use: ${c.name} with input ${JSON.stringify(c.input || {})}]`;
+          if (c.type === 'tool_result') {
+            let resText = c.content;
+            if (Array.isArray(resText)) {
+              resText = resText.map(rc => (typeof rc === 'string' ? rc : rc.text || JSON.stringify(rc))).join('\n');
+            } else if (typeof resText !== 'string') {
+              resText = JSON.stringify(resText || '');
+            }
+            return `[Tool Result (${c.tool_use_id || ''}): ${resText}]`;
+          }
+          return c.text || c.content || JSON.stringify(c);
+        })
+        .join('\n');
+    } else if (typeof content !== 'string') {
+      content = JSON.stringify(content || '');
+    }
+    parts.push(`${role}:\n${content || ''}`);
+  }
+
+  if (parts.length === 0) return '';
+  if (parts.length === 1 && !systemText && messages.length === 1 && messages[0].role === 'user') {
+    const firstContent = messages[0].content;
+    if (typeof firstContent === 'string') return firstContent;
+  }
+
+  return parts.join('\n\n---\n\n') + '\n\nModel:\n';
 }
 
 function handleAntigravityChat(model, payload, res, apiFormat) {
-  const prompt = formatMessagesToPrompt(payload.messages || []);
+  const prompt = formatMessagesToPrompt(payload);
   const isStream = payload.stream === true;
   log(`🤖 [Antigravity] Modelo: ${model} | Formato: ${apiFormat} | Stream: ${isStream} | Prompt: ${prompt.length} chars`);
 
@@ -228,16 +265,47 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
   const msgId = `msg_${Date.now()}`;
   const created = Math.floor(Date.now() / 1000);
 
+  // Evita o limite E2BIG (Argument list too long) do Linux passando o prompt via stdin em formato stream-json
   const args = [
     `--model=${model}`,
-    '--output-format=text',
-    `--print=${prompt}`
+    '--disable-slash-commands',
+    '--input-format=stream-json',
+    '--output-format=stream-json'
   ];
 
-  const proc = spawn(AGY_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const proc = spawn(AGY_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+  const inputPayload = JSON.stringify({
+    event: 'user',
+    message: {
+      content: prompt || ' '
+    }
+  });
+
+  proc.stdin.on('error', err => {
+    log(`⚠️  [Antigravity proc.stdin]: ${err.message}`);
+  });
+
+  proc.on('error', err => {
+    log(`❌ [Antigravity spawn error]: ${err.message}`);
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: `Falha ao iniciar processo Antigravity: ${err.message}`, type: 'api_error' } }));
+    }
+  });
+
+  proc.stdin.write(inputPayload + '\n', () => {
+    proc.stdin.end();
+  });
 
   let stderrOutput = '';
+  let stdoutBuffer = '';
   let sentAnyChunk = false;
+  let accumulatedText = '';
+  let finalResponse = '';
+  let usageData = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+  let resultError = null;
+  let pingInterval = null;
 
   proc.stderr.on('data', errData => {
     const text = errData.toString();
@@ -267,9 +335,9 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
     }
 
     // Heartbeat keep-alive para evitar timeout em clientes HTTP (ex: Claude Code / Cursor)
-    const pingInterval = setInterval(() => {
+    pingInterval = setInterval(() => {
       if (res.writableEnded || res.destroyed) {
-        clearInterval(pingInterval);
+        if (pingInterval) clearInterval(pingInterval);
         return;
       }
       if (apiFormat === 'anthropic') {
@@ -278,36 +346,90 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
         res.write(': ping\n\n');
       }
     }, 5000);
+  }
 
-    res.on('close', () => {
-      clearInterval(pingInterval);
-      if (!proc.killed) {
-        try { proc.kill('SIGTERM'); } catch (_) {}
+  res.on('close', () => {
+    if (pingInterval) clearInterval(pingInterval);
+    if (!proc.killed) {
+      try { proc.kill('SIGTERM'); } catch (_) {}
+    }
+  });
+
+  function processStdoutLine(line) {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (_) {
+      return;
+    }
+
+    if (parsed.event === 'step_update' && parsed.step_update) {
+      const step = parsed.step_update;
+      if (step.step_type === 'agent_response' && step.text_delta) {
+        const text = step.text_delta;
+        sentAnyChunk = true;
+        accumulatedText += text;
+
+        if (isStream) {
+          if (apiFormat === 'anthropic') {
+            res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })}\n\n`);
+          } else {
+            const sseData = {
+              id: completionId,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+            };
+            res.write(`data: ${JSON.stringify(sseData)}\n\n`);
+          }
+        }
       }
-    });
-
-    proc.stdout.on('data', chunk => {
-      const text = chunk.toString();
-      if (!text) return;
-      sentAnyChunk = true;
-      if (apiFormat === 'anthropic') {
-        res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })}\n\n`);
-      } else {
-        const sseData = {
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+      if (step.usage) {
+        usageData = {
+          input_tokens: step.usage.input_tokens ?? usageData.input_tokens,
+          output_tokens: step.usage.output_tokens ?? usageData.output_tokens,
+          total_tokens: step.usage.total_tokens ?? usageData.total_tokens
         };
-        res.write(`data: ${JSON.stringify(sseData)}\n\n`);
       }
-    });
+    } else if (parsed.event === 'result' && parsed.result) {
+      if (parsed.result.response) {
+        finalResponse = parsed.result.response;
+      }
+      if (parsed.result.usage) {
+        usageData = {
+          input_tokens: parsed.result.usage.input_tokens ?? usageData.input_tokens,
+          output_tokens: parsed.result.usage.output_tokens ?? usageData.output_tokens,
+          total_tokens: parsed.result.usage.total_tokens ?? usageData.total_tokens
+        };
+      }
+      if (parsed.result.status === 'ERROR' && parsed.result.error) {
+        resultError = parsed.result.error;
+      }
+    }
+  }
 
-    proc.on('close', code => {
-      clearInterval(pingInterval);
-      if (code !== 0 && !sentAnyChunk && stderrOutput) {
-        let cleanErr = stderrOutput.trim();
+  proc.stdout.on('data', chunk => {
+    stdoutBuffer += chunk.toString();
+    const lines = stdoutBuffer.split('\n');
+    stdoutBuffer = lines.pop();
+    for (const l of lines) {
+      processStdoutLine(l);
+    }
+  });
+
+  proc.on('close', code => {
+    if (pingInterval) clearInterval(pingInterval);
+    if (stdoutBuffer.trim()) {
+      processStdoutLine(stdoutBuffer);
+      stdoutBuffer = '';
+    }
+
+    if (isStream) {
+      if (code !== 0 && !sentAnyChunk && (resultError || stderrOutput)) {
+        let cleanErr = (resultError || stderrOutput).trim();
         try {
           const m = cleanErr.match(/AGY_ERROR:\s*(\{.*\})/);
           if (m) {
@@ -325,7 +447,7 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
 
       if (apiFormat === 'anthropic') {
         res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
-        res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } })}\n\n`);
+        res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: usageData.output_tokens || 0 } })}\n\n`);
         res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
       } else {
         const finalChunk = {
@@ -333,20 +455,22 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
           object: 'chat.completion.chunk',
           created,
           model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: {
+            prompt_tokens: usageData.input_tokens || 0,
+            completion_tokens: usageData.output_tokens || 0,
+            total_tokens: usageData.total_tokens || 0
+          }
         };
         res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
         res.write('data: [DONE]\n\n');
       }
       res.end();
       log(`✅ [Antigravity] Finalizado com código ${code}`);
-    });
-  } else {
-    let output = '';
-    proc.stdout.on('data', chunk => { output += chunk.toString(); });
-    proc.on('close', code => {
-      if (code !== 0 && !output && stderrOutput) {
-        output = `⚠️ [agent-proxy]: ${stderrOutput.trim()}`;
+    } else {
+      let output = finalResponse || accumulatedText;
+      if (code !== 0 && !output && (resultError || stderrOutput)) {
+        output = `⚠️ [agent-proxy]: ${(resultError || stderrOutput).trim()}`;
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       if (apiFormat === 'anthropic') {
@@ -357,7 +481,10 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
           model,
           content: [{ type: 'text', text: output.trim() }],
           stop_reason: 'end_turn',
-          usage: { input_tokens: 0, output_tokens: 0 }
+          usage: {
+            input_tokens: usageData.input_tokens || 0,
+            output_tokens: usageData.output_tokens || 0
+          }
         }));
       } else {
         res.end(JSON.stringify({
@@ -372,12 +499,16 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
               finish_reason: 'stop'
             }
           ],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+          usage: {
+            prompt_tokens: usageData.input_tokens || 0,
+            completion_tokens: usageData.output_tokens || 0,
+            total_tokens: usageData.total_tokens || 0
+          }
         }));
       }
       log(`✅ [Antigravity] Resposta enviada com sucesso (código ${code})`);
-    });
-  }
+    }
+  });
 }
 
 function isReasoningModel(model) {

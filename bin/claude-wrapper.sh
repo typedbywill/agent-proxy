@@ -12,6 +12,8 @@ export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1
 export API_TIMEOUT_MS=600000                       # 10 minutos para a requisição geral
 export CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=300000  # 5 minutos aguardando o primeiro chunk
 export CLAUDE_STREAM_IDLE_TIMEOUT_MS=300000        # 5 minutos de inatividade entre chunks
+# Impede auto-updates em background que corrompem binários ou quebram symlinks no NixOS
+export DISABLE_AUTOUPDATER=1
 unset ANTHROPIC_AUTH_TOKEN
 
 # Se o proxy não estiver rodando, sobe imediatamente
