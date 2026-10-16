@@ -6,11 +6,16 @@ const TOOL_CALL_START = '<<TOOL_CALL>>';
 const TOOL_CALL_END = '<<END_TOOL_CALL>>';
 
 const STOP_SEQUENCES = [
-  '\n\n---\n\n',
-  '\n---\n',
-  '\nUser:',
-  '\nHuman:',
-  '\n[Tool Result'
+  '\n\n---\n\nUser:',
+  '\n---\nUser:',
+  '\n\n---\n\nHuman:',
+  '\n---\nHuman:',
+  '\n\n---\n\nModel:',
+  '\n---\nModel:',
+  '\nUser:\n',
+  '\nHuman:\n',
+  '\n[Tool Result',
+  '[Tool Result'
 ];
 
 function findFirstStopSequence(buffer, patterns = STOP_SEQUENCES) {

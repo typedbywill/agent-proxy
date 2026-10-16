@@ -716,16 +716,21 @@ function handleAntigravityChat(model, payload, res, apiFormat) {
       log(`✅ [Antigravity] Resposta enviada com sucesso (código ${exitCode})`);
     }
 
-    if (!proc.killed) {
-      try { proc.kill('SIGTERM'); } catch (_) {}
+    killProcess();
+  }
+
+  function killProcess() {
+    if (proc && proc.pid) {
+      try { process.kill(proc.pid, 'SIGTERM'); } catch (_) {}
+      setTimeout(() => {
+        try { process.kill(proc.pid, 'SIGKILL'); } catch (_) {}
+      }, 800);
     }
   }
 
   res.on('close', () => {
     if (pingInterval) clearInterval(pingInterval);
-    if (!proc.killed) {
-      try { proc.kill('SIGTERM'); } catch (_) {}
-    }
+    killProcess();
   });
 
   function processStdoutLine(line) {
