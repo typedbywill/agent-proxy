@@ -107,6 +107,34 @@ O Claude Code se conectará automaticamente na porta `8080` e usará o cérebro 
 
 ---
 
+## 🔧 Suporte a Ferramentas (Tool Calling)
+
+O `agent-proxy` possui suporte bidirecional completo a **Function Calling / Tool Calling** para Antigravity CLI e modelos remotos, compatível tanto com o protocolo **Anthropic Messages** (`tool_use`, `tool_result`) quanto **OpenAI Chat Completions** (`tool_calls`, `role: tool`).
+
+### Como Funciona:
+1. **Catálogo no Prompt:** Quando o cliente (ex: Claude Code) envia a lista `tools`, o proxy injeta automaticamente no prompt do sistema a especificação completa (nome, descrição e `input_schema`), regras de sintaxe e exemplos de uso.
+2. **Marcador de Protocolo Delimitado:** O modelo emite chamadas no formato:
+   ```text
+   <<TOOL_CALL>>{"name":"Read","input":{"file_path":"src/server.js"}}<<END_TOOL_CALL>>
+   ```
+3. **Parser de Streaming com Lookahead Buffer:**
+   - O proxy acumula chunks e retém no buffer potenciais prefixos de `<<TOOL_CALL>>`, impedindo que pedaços parciais de marcadores vazem para o cliente.
+   - Ao fechar o bloco, emite ordenadamente os eventos de SSE: `content_block_start` (`tool_use`), `content_block_delta` (`input_json_delta`), `content_block_stop` e `message_delta` (`stop_reason: "tool_use"`).
+4. **Finalização Imediata pelo Evento `result`:** A resposta SSE é encerrada assim que o Antigravity emite o evento `result`, sem travar aguardando o fechamento do subprocesso.
+5. **Histórico Consistente:** Mensagens de turnos anteriores contendo `tool_use` ou `tool_calls` são renderizadas com os mesmos delimitadores, garantindo contexto idêntico para o modelo associar chamadas e `tool_result`s.
+
+---
+
+## ⚠️ Riscos e Limitações Conhecidas
+
+- **Conformidade do Modelo:** Modelos da família Gemini Flash podem ocasionalmente alucinar nomes de parâmetros ou falhar no fechamento de marcadores. **Mitigação:** O proxy possui fallback automático; caso o JSON seja inválido ou o nome da ferramenta não exista no catálogo, o conteúdo é logado e emitido como texto normal sem quebrar a sessão.
+- **Latência e Tamanho do Prompt:** O catálogo completo de ferramentas do Claude Code (~11,8 KB por turno) eleva o uso de tokens de entrada e pode acrescentar de 1 a 2 segundos no tempo de resposta do primeiro token.
+- **Segurança:** O Claude Code executa comandos de leitura, edição e execução no terminal. Mantenha os prompts de confirmação ativados no Claude Code ao utilizar modelos rápidos para evitar execuções indesejadas.
+- **Complexidade de Raciocínio:** Embora o protocolo funcione perfeitamente com Gemini Flash, tarefas complexas de refatoração ou raciocínio em múltiplos arquivos podem demandar modelos mais potentes (`claude-sonnet-5-5-high` ou `deepseek-r1`).
+
+---
+
 ## 📄 Licença
 
 MIT © [William Gerhard Bueno](https://github.com/typedbywill)
+
